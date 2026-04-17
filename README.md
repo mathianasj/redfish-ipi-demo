@@ -1,385 +1,465 @@
-# EC2 Nested Virtualization Setup with Redfish Support
+# OpenShift IPI Baremetal Demo with Redfish
 
-This Ansible playbook creates an AWS EC2 instance configured for nested virtualization, allowing you to run multiple VMs inside the EC2 instance using KVM/QEMU.
+This repository provides an automated lab environment for demonstrating **OpenShift Installer Provisioned Infrastructure (IPI)** installations using **Redfish** and **virtual media** - simulating a real baremetal deployment on AWS EC2 with nested virtualization.
 
-**Operating System**: Red Hat Enterprise Linux 9 (RHEL 9)
+## Purpose
 
-**Features**:
-- KVM/QEMU nested virtualization
-- **Baremetal network bridge** for direct network access
-- Cockpit web console for VM management
-- **Sushy Redfish emulator** for BMC-style VM control
-- **Virtual Media support** for ISO mounting via Redfish API
-- **Multi-volume storage** - 500GB root, 1TB storage, 500GB OpenShift
+Demonstrate how OpenShift IPI installation works with baremetal infrastructure by:
+- Creating "virtual baremetal" nodes (KVM VMs on EC2)
+- Exposing them via **Redfish API** using **sushy-tools** (Redfish BMC emulator)
+- Using **virtual media** to mount ISOs and provision nodes
+- Running OpenShift IPI installer to provision the cluster using Redfish
 
-See documentation:
-- [QUICK_START.md](QUICK_START.md) - Quick reference guide
-- [RHEL_SETUP.md](RHEL_SETUP.md) - RHEL 9-specific configuration and usage
-- [NETWORKING.md](NETWORKING.md) - Network bridge and configuration details
-- [SUSHY_REDFISH.md](SUSHY_REDFISH.md) - Redfish API and virtual media guide
-- [DNS_SETUP.md](DNS_SETUP.md) - DNS configuration for OpenShift
-- [CPU_OPTIONS.md](CPU_OPTIONS.md) - CPU configuration for nested virtualization
-- [INSTANCE_TYPES.md](INSTANCE_TYPES.md) - Instance type comparison and pricing
-- [CLEANUP.md](CLEANUP.md) - How to delete all resources
+This allows you to demonstrate and test OpenShift baremetal IPI workflows without needing physical servers or expensive bare-metal cloud instances.
 
-## Prerequisites
+## Architecture
 
-1. **AWS Account** with appropriate permissions to create:
-   - VPC, Subnets, Internet Gateways
-   - Security Groups
-   - EC2 Instances
+```
+┌─────────────────────────────────────────────────────────┐
+│ AWS EC2 Instance (m8i.16xlarge)                         │
+│ RHEL 9 with nested virtualization                       │
+│                                                           │
+│  ┌────────────────────────────────────────────────────┐ │
+│  │ Sushy-tools (Redfish BMC Emulator)                 │ │
+│  │ Port 8000: http://<ip>:8000/redfish/v1/           │ │
+│  │ - Presents KVM VMs as "baremetal" nodes            │ │
+│  │ - Supports virtual media (ISO mounting)            │ │
+│  │ - Provides power management                        │ │
+│  └────────────────────────────────────────────────────┘ │
+│                                                           │
+│  ┌────────────────────────────────────────────────────┐ │
+│  │ KVM Virtual Machines (Masters/Workers)             │ │
+│  │ - ocp-master-1, ocp-master-2, ocp-master-3        │ │
+│  │ - ocp-worker-1, ocp-worker-2, ...                 │ │
+│  │ - Exposed via Redfish API                          │ │
+│  └────────────────────────────────────────────────────┘ │
+│                                                           │
+│  ┌────────────────────────────────────────────────────┐ │
+│  │ VyOS Router (optional)                             │ │
+│  │ - Network isolation and routing                    │ │
+│  └────────────────────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────── ┘
 
-2. **AWS Credentials** configured via:
-   - AWS CLI (`aws configure`)
-   - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
-   - IAM role (if running from EC2)
+OpenShift IPI Installer → Redfish API → Sushy → KVM VMs
+                        (virtual media)
+```
 
-3. **SSH Key Pair** - The playbook will automatically create one from your public key (default: `~/.ssh/id_rsa.pub`)
+## Features
 
-4. **Python packages**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+### OpenShift IPI Capabilities
+- ✅ **Full IPI installation** - OpenShift installer manages the entire deployment
+- ✅ **Redfish virtual media** - ISOs mounted to boot RHCOS
+- ✅ **BMC simulation** - Sushy-tools emulates Redfish BMC
+- ✅ **Baremetal simulation** - KVM VMs act as physical servers
+- ✅ **Worker scaling** - Add/remove workers via BareMetalHost resources
+- ✅ **Agent-based installer** - Pre-provision VMs, then run installer
 
-5. **Ansible collections**:
-   ```bash
-   ansible-galaxy collection install -r requirements.yml
-   ```
+### Infrastructure Components
+- **Nested Virtualization** - KVM on EC2 (no bare-metal instance required!)
+- **Redfish API** - Industry-standard baremetal management
+- **Virtual Media** - Mount ISOs via Redfish for OS installation
+- **Network Isolation** - VyOS router for realistic networking
+- **DNS** - BIND DNS for OpenShift cluster resolution
+- **Storage** - 2TB total (500GB root + 1TB storage + 500GB OpenShift)
+- **Web Console** - Cockpit for VM management
 
-## Instance Types Supporting Nested Virtualization
+## Quick Start
 
-AWS now supports nested virtualization on many Nitro-based instance types (no bare metal required!):
-
-### Recommended (Cost-Effective):
-- **M7i family**: `m7i.large`, `m7i.xlarge`, `m7i.2xlarge`, etc. (~$0.20-$0.40/hour)
-- **M6i family**: `m6i.large`, `m6i.xlarge`, `m6i.2xlarge`, etc. (~$0.19-$0.38/hour)
-- **C7i family**: `c7i.large`, `c7i.xlarge`, `c7i.2xlarge`, etc. (compute-optimized)
-- **C6i family**: `c6i.large`, `c6i.xlarge`, `c6i.2xlarge`, etc. (compute-optimized)
-
-### Other Supported Families:
-- M7a, M6a, M5n, M5zn (AMD-based)
-- R7i, R7a, R6i, R6a (memory-optimized)
-- C7a, C6a, C5n (compute-optimized)
-
-### Expensive Options (if needed):
-- **Metal instances**: `m5.metal`, `c5.metal`, `r5.metal`, etc. (~$4-5/hour)
-
-**Default**: The playbook uses `m7i.2xlarge` (8 vCPUs, 32GB RAM, ~$0.40/hour) - a great balance of performance and cost.
-
-Adjust `instance_type` in `group_vars/all.yml` based on your needs and budget.
-
-## Configuration
-
-1. **Update `group_vars/all.yml`**:
-   - Set `ssh_public_key_path` to your SSH public key (default: `~/.ssh/id_rsa.pub`)
-   - **IMPORTANT**: Change `cockpit_admin_password` to a secure password
-   - Optionally change `cockpit_admin_user` (default: `admin`)
-   - Choose your `aws_region` (default: `us-east-2`)
-   - Select appropriate `instance_type` (default: `m8i.16xlarge`)
-   - Configure CPU options for nested virtualization:
-     - `cpu_core_count`: Number of CPU cores (default: 32 for m8i.16xlarge)
-     - `cpu_threads_per_core`: Threads per core (2 = hyperthreading enabled, recommended)
-   - See [CPU_OPTIONS.md](CPU_OPTIONS.md) for configuration by instance type
-   - Optionally update `key_name` (EC2 key pair name to create)
-   - Update `ami_mappings` for your region if needed
-
-2. **Update security settings**:
-   - The playbook creates a security group allowing:
-     - SSH (22)
-     - Cockpit web console (9090)
-     - Redfish API (8000)
-     - VNC (5900-5910)
-   - Restrict CIDR blocks in `playbook.yml` for production use
-
-## Usage
-
-### Deploy the EC2 Instance
+### 1. Prerequisites
 
 ```bash
-# Activate the virtual environment
-source venv/bin/activate
+# Clone the repository
+git clone https://github.com/mathianasj/redfish-ipi-demo.git
+cd redfish-ipi-demo
 
-# Run the playbook
+# Install Python dependencies
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# Install Ansible collections
+ansible-galaxy collection install -r requirements.yml
+
+# Configure AWS credentials
+aws configure
+```
+
+### 2. Configure Variables
+
+Edit `group_vars/all.yml`:
+```yaml
+# AWS Configuration
+aws_region: us-east-2
+instance_type: m8i.16xlarge  # 32 cores, 64 threads, 128GB RAM
+
+# SSH Keys
+ssh_public_key_path: "~/.ssh/id_rsa_fips.pub"
+ssh_private_key_path: "~/.ssh/id_rsa_fips"
+
+# Security
+cockpit_admin_password: "YourSecurePassword123!"  # CHANGE THIS!
+
+# OpenShift
+ocp_cluster_name: ocp
+ocp_base_domain: example.com
+```
+
+Add your OpenShift pull secret:
+```bash
+# Download from https://console.redhat.com/openshift/install/pull-secret
+cp pullsecret.json.example pullsecret.json
+# Edit pullsecret.json with your actual pull secret
+```
+
+### 3. Deploy Complete Environment
+
+```bash
+# Deploy EC2 instance with nested virt + OpenShift cluster
 ansible-playbook playbook.yml
 ```
 
+This automated playbook will:
+1. ✅ Create AWS infrastructure (VPC, subnets, EC2 instance)
+2. ✅ Configure nested virtualization and KVM
+3. ✅ Install and configure Sushy Redfish emulator
+4. ✅ Set up DNS for OpenShift
+5. ✅ Create master VMs (3 nodes)
+6. ✅ Generate install-config.yaml
+7. ✅ Run OpenShift IPI installer
+8. ✅ Configure cluster access
+
+**Time**: ~60-90 minutes total
+
+### 4. Access Your Cluster
+
+After installation completes:
+
+```bash
+# SSH to EC2 instance
+ssh ec2-user@<instance-ip>
+
+# Get cluster credentials
+cat ~/openshift-cluster-access.txt
+
+# Access web console
+https://console-openshift-console.apps.ocp.example.com
+
+# Use CLI
+export KUBECONFIG=~/openshift-install/auth/kubeconfig
+oc get nodes
+oc get co  # Check cluster operators
+```
+
+## Individual Components
+
+### Deploy Infrastructure Only
+
+```bash
+# Just create EC2 + KVM + Sushy (no OpenShift)
+ansible-playbook playbook.yml --tags infrastructure
+```
+
+### Install VyOS Router
+
+```bash
+# Deploy VyOS for network management
+ansible-playbook install-vyos.yml
+```
+
+Features:
+- Automated installation from ISO
+- Dynamic network configuration
+- Static IP assignment
+- SSH enabled
+- Persistent configuration
+
+### Scale Workers
+
+```bash
+# Add workers to existing cluster
+ansible-playbook scale-workers.yml -e worker_count=2
+```
+
 This will:
-1. Import your SSH public key to create an EC2 key pair
-2. Create VPC, subnet, internet gateway, and security group
-3. Launch an EC2 instance with nested virtualization support and configure storage:
-   - 500GB root volume (boot disk)
-   - 1TB volume for general VM storage at `/storage`
-   - 500GB volume for OpenShift images at `/var/lib/libvirt/openshift-images`
-4. Install and configure KVM/QEMU
-5. Create a network bridge named `baremetal` using the primary network interface
-6. Set up libvirt for VM management with storage at `/storage/vms`
-7. Install Cockpit web console for easy VM management
-8. Install and configure Sushy Redfish emulator with virtual media support
-9. Create a sudo-enabled admin user for Cockpit access
+- Create additional worker VMs
+- Expose them via Redfish
+- Create BareMetalHost manifests
+- Let OpenShift provision them automatically
 
-**Note**: The playbook automatically creates the EC2 key pair from your SSH public key (default: `~/.ssh/id_rsa.pub`). You can specify a different key by updating `ssh_public_key_path` in `group_vars/all.yml`.
+## How OpenShift IPI Works with Redfish
 
-**Security**: The playbook will display the Cockpit URL and credentials at the end. Make sure to change the default password in `group_vars/all.yml` before running!
+### Installation Flow
 
-### Verify Nested Virtualization
+1. **Preparation**
+   - Create master VMs (powered off)
+   - Get VM UUIDs from libvirt
+   - Configure Redfish URLs in install-config.yaml
 
-SSH into the instance and run:
+2. **Bootstrap**
+   ```yaml
+   platform:
+     baremetal:
+       apiVIPs: [192.168.122.10]
+       ingressVIPs: [192.168.122.11]
+       hosts:
+         - name: master-1
+           role: master
+           bmc:
+             address: redfish-virtualmedia://192.168.122.1:8000/redfish/v1/Systems/<uuid>
+             username: admin
+             password: password
+           bootMACAddress: "52:54:00:xx:xx:xx"
+   ```
+
+3. **IPI Installer Actions**
+   - Uses Redfish API to power on VMs
+   - Mounts RHCOS ISO via virtual media
+   - Boots nodes from ISO
+   - Installs RHCOS to disk
+   - Configures networking
+   - Joins cluster
+
+4. **Day 2 Operations**
+   - Create BareMetalHost resources
+   - Kubernetes manages baremetal nodes
+   - Scale workers up/down dynamically
+
+### Redfish API Examples
+
 ```bash
-# Check if nested virtualization is enabled
-cat /sys/module/kvm_intel/parameters/nested  # For Intel CPUs
-# or
-cat /sys/module/kvm_amd/parameters/nested    # For AMD CPUs
-
-# Should return: Y or 1
-
-# Verify KVM is working
-lsmod | grep kvm
-virsh capabilities
-```
-
-### Create a VM
-
-#### Using virt-install (CLI):
-```bash
-sudo virt-install \
-  --name testvm \
-  --ram 4096 \
-  --vcpus 2 \
-  --disk path=/var/lib/libvirt/images/testvm.qcow2,size=20 \
-  --os-variant rhel9 \
-  --network network=default \
-  --graphics vnc,listen=0.0.0.0 \
-  --console pty,target_type=serial \
-  --location http://mirror.centos.org/centos/9-stream/BaseOS/x86_64/os/
-```
-
-#### Using Cockpit Web Console:
-1. Access `https://<instance-public-ip>:9090` (URL displayed at end of playbook)
-2. Login with the admin credentials:
-   - Username: `admin` (or as configured in `group_vars/all.yml`)
-   - Password: As set in `group_vars/all.yml`
-3. Navigate to "Virtual Machines"
-4. Click "Create VM"
-
-### Manage VMs
-
-#### Using virsh (CLI)
-```bash
-# List all VMs
-sudo virsh list --all
-
-# Start a VM
-sudo virsh start <vm-name>
-
-# Stop a VM
-sudo virsh shutdown <vm-name>
-
-# Delete a VM
-sudo virsh undefine <vm-name>
-sudo virsh vol-delete --pool default <vm-name>.qcow2
-
-# Access VM console
-sudo virsh console <vm-name>
-```
-
-#### Using Redfish API
-```bash
-# List all systems
+# List all "baremetal" nodes
 curl http://<instance-ip>:8000/redfish/v1/Systems | jq
 
-# Get VM UUID
-VM_UUID=$(sudo virsh domuuid <vm-name>)
+# Get node details
+curl http://<instance-ip>:8000/redfish/v1/Systems/<uuid> | jq
 
-# Power on
-curl -X POST http://<instance-ip>:8000/redfish/v1/Systems/$VM_UUID/Actions/ComputerSystem.Reset \
+# Power on node
+curl -X POST http://<instance-ip>:8000/redfish/v1/Systems/<uuid>/Actions/ComputerSystem.Reset \
   -H "Content-Type: application/json" \
   -d '{"ResetType": "On"}'
 
-# Mount ISO as virtual media
-curl -X POST http://<instance-ip>:8000/redfish/v1/Systems/$VM_UUID/VirtualMedia/Cd/Actions/VirtualMedia.InsertMedia \
+# Mount ISO via virtual media
+curl -X POST http://<instance-ip>:8000/redfish/v1/Systems/<uuid>/VirtualMedia/Cd/Actions/VirtualMedia.InsertMedia \
   -H "Content-Type: application/json" \
-  -d '{
-    "Image": "file:///var/lib/sushy/vmedia/my.iso",
-    "Inserted": true,
-    "WriteProtected": true
-  }'
+  -d '{"Image": "file:///storage/vmedia/rhcos.iso", "Inserted": true}'
 ```
 
-See [SUSHY_REDFISH.md](SUSHY_REDFISH.md) for complete Redfish API documentation.
+See [SUSHY_REDFISH.md](SUSHY_REDFISH.md) for complete API documentation.
 
-## Network Configuration
+## AWS Instance Types
 
-The playbook configures networking as follows:
+This lab uses **m8i.16xlarge** by default (32 cores, 128GB RAM) but works on any Nitro instance supporting nested virtualization:
 
-### Baremetal Bridge
+### Recommended Options
 
-A network bridge named `baremetal` is created using the primary network interface:
-- **Bridge Name**: `baremetal`
-- **Attached Interface**: Primary NIC (typically `eth0` or `ens5`)
-- **IP Configuration**: DHCP (inherits from primary interface)
-- **Purpose**: Used by OpenShift and other bare-metal workloads
+| Instance | vCPUs | RAM | Cost/hr | Use Case |
+|----------|-------|-----|---------|----------|
+| m8i.16xlarge | 64 | 128GB | ~$3.50 | **Full OpenShift cluster** (recommended) |
+| m7i.8xlarge | 32 | 128GB | ~$1.60 | 3 masters + 2 workers |
+| m7i.4xlarge | 16 | 64GB | ~$0.80 | Minimal cluster (3 masters only) |
+| m6i.4xlarge | 16 | 64GB | ~$0.76 | Budget option |
 
-Check bridge status:
-```bash
-# View bridge details
-ip addr show baremetal
-nmcli connection show baremetal
+### Nested Virtualization Support
 
-# View bridge connections
-bridge link show
-```
+All modern AWS Nitro instances support nested virtualization - **no bare-metal required**!
 
-### Default NAT Network
+- M7i, M6i, M8i families
+- C7i, C6i families  
+- R7i, R6i families
+- And many more...
 
-A default NAT network (`virbr0`) is also configured:
-- **Network**: 192.168.122.0/24
-- **Gateway**: 192.168.122.1
-- **DHCP Range**: 192.168.122.2-254
-- **Purpose**: Isolated network for VMs
+See [INSTANCE_TYPES.md](INSTANCE_TYPES.md) for complete list and pricing.
 
-VMs can use either:
-1. **Baremetal bridge** - For direct network access (recommended for OpenShift)
-2. **NAT network (virbr0)** - For isolated VMs with NAT
+## Storage Configuration
 
-### Network Troubleshooting
+**Total Storage**: 2TB across 3 volumes
 
-```bash
-# List all network connections
-nmcli connection show
+| Volume | Size | Mount | Purpose |
+|--------|------|-------|---------|
+| Root | 500GB | `/` | Operating system |
+| Storage | 1TB | `/storage` | VM disks, ISOs, virtual media |
+| OpenShift | 500GB | `/var/lib/libvirt/openshift-images` | OpenShift VM images |
 
-# Restart NetworkManager
-sudo systemctl restart NetworkManager
-
-# Check libvirt networks
-sudo virsh net-list --all
-
-# View bridge configuration
-sudo nmcli connection show baremetal
-```
-
-## Storage
-
-### Storage Layout
-
-The playbook creates three EBS volumes for complete storage solution:
-
-**Root Volume** - 500GB (boot disk):
-```
-/ (root filesystem)
-# Operating system and system files
-```
-
-**Primary Storage** - 1TB mounted at `/storage`:
 ```
 /storage/
-├── vms/         # VM disk images (libvirt default pool)
-├── isos/        # ISO images for OS installation
-├── vmedia/      # Virtual media for Redfish (ISOs, images)
+├── vms/         # VM disk images (QCOW2)
+├── isos/        # ISO files (RHCOS, etc.)
+├── vmedia/      # Virtual media for Redfish
 └── backups/     # VM backups
 ```
 
-**OpenShift Images** - 500GB mounted at `/var/lib/libvirt/openshift-images`:
+## Network Configuration
+
+### Default libvirt Network
+
 ```
-/var/lib/libvirt/openshift-images/
-# Dedicated storage for OpenShift cluster VM images
-```
-
-**Total Storage**: 2TB (500GB root + 1TB storage + 500GB OpenShift)
-
-### Configuration
-
-- **Root volume size**: Configure `root_volume_size` in `group_vars/all.yml` (default: 500 GB)
-- **Storage volume size**: Configure `storage_volume_size` in `group_vars/all.yml` (default: 1024 GB)
-- **OpenShift volume size**: Configure `openshift_volume_size` in `group_vars/all.yml` (default: 500 GB)
-- **Volume type**: gp3 (3000 IOPS, 125 MB/s throughput) for all volumes
-- **Filesystem**: XFS with noatime for better performance
-- **Persistence**: Additional volumes automatically added to `/etc/fstab`
-- **Compatibility**: `/var/lib/libvirt/images` symlinked to `/storage/vms`
-
-### Storage Locations
-
-| Purpose | Path | Used By | Size |
-|---------|------|---------|------|
-| Root/OS | `/` (root filesystem) | Operating System | 500GB |
-| VM Disks | `/storage/vms` | libvirt default pool | 1TB |
-| ISO Files | `/storage/isos` | Manual storage | 1TB (shared) |
-| Virtual Media | `/storage/vmedia` | Sushy Redfish emulator | 1TB (shared) |
-| Backups | `/storage/backups` | Manual backups | 1TB (shared) |
-| OpenShift VMs | `/var/lib/libvirt/openshift-images` | OpenShift installer | 500GB |
-
-### Checking Storage
-
-```bash
-# Check mounted filesystems
-df -h /storage /var/lib/libvirt/openshift-images
-
-# Check storage usage
-du -sh /storage/*
-du -sh /var/lib/libvirt/openshift-images/*
-
-# List VMs in storage pool
-sudo virsh vol-list default
-
-# Check all block devices
-lsblk
+Network: 192.168.122.0/24
+Gateway: 192.168.122.1
+DHCP: 192.168.122.100-254
+Static: 192.168.122.2-99 (for OpenShift)
 ```
 
-## Costs
+### Baremetal Bridge
 
-Using non-bare-metal instances is **much more affordable**! Example pricing (on-demand, us-east-1):
+EC2 primary interface is bridged for direct network access:
+- Bridge: `baremetal`
+- Used by: OpenShift cluster VMs
+- Access: Direct network connectivity
 
-### Recommended Instances:
-- `m7i.large`: ~$0.20/hour (~$144/month) - 2 vCPUs, 8GB RAM
-- `m7i.xlarge`: ~$0.40/hour (~$288/month) - 4 vCPUs, 16GB RAM
-- `m7i.2xlarge`: ~$0.80/hour (~$576/month) - 8 vCPUs, 32GB RAM
-- `m6i.2xlarge`: ~$0.38/hour (~$274/month) - 8 vCPUs, 32GB RAM
+### VyOS Router (Optional)
 
-### Bare Metal (for comparison):
-- `m5.metal`: ~$4.60/hour (~$3,300/month) - 96 vCPUs, 384GB RAM
+For network isolation and advanced routing:
+- IP: 192.168.122.10/24
+- Gateway: 192.168.122.1
+- Access: `ssh vyos@192.168.122.10`
 
-**Cost Savings Tips**:
-- Use **Spot Instances** for 60-90% discount (may be interrupted)
-- Use **Reserved Instances** for 30-60% discount (1-3 year commitment)
-- Start with smaller instances like `m7i.large` for testing
+## Documentation
+
+### Quick References
+- [QUICK_START.md](QUICK_START.md) - Fast deployment guide
+- [QUICK_REFERENCE.md](QUICK_REFERENCE.md) - Common commands
+
+### Infrastructure Setup
+- [RHEL_SETUP.md](RHEL_SETUP.md) - RHEL 9 configuration
+- [NETWORKING.md](NETWORKING.md) - Network architecture
+- [DNS_SETUP.md](DNS_SETUP.md) - DNS configuration for OpenShift
+- [INSTANCE_TYPES.md](INSTANCE_TYPES.md) - AWS instance comparison
+
+### Redfish & OpenShift
+- [SUSHY_REDFISH.md](SUSHY_REDFISH.md) - Redfish API guide
+- [COMPLETE_DEPLOYMENT.md](COMPLETE_DEPLOYMENT.md) - Full deployment workflow
+
+### Troubleshooting
+- [KVM_NESTED_VIRT_FIX.md](KVM_NESTED_VIRT_FIX.md) - Nested virt issues
+- [VM_PAUSED_TROUBLESHOOTING.md](VM_PAUSED_TROUBLESHOOTING.md) - VM stability
+- [CPU_OPTIONS.md](CPU_OPTIONS.md) - CPU configuration
+
+### Management
+- [VNC_ACCESS_GUIDE.md](VNC_ACCESS_GUIDE.md) - Remote desktop access
+- [CLEANUP.md](CLEANUP.md) - Resource deletion
+
+## Cost Estimation
+
+**On-Demand Pricing** (us-east-2):
+
+| Duration | m8i.16xlarge | m7i.8xlarge | m6i.4xlarge |
+|----------|--------------|-------------|-------------|
+| 1 hour | $3.50 | $1.60 | $0.76 |
+| 8 hours | $28 | $13 | $6 |
+| 1 month | $2,520 | $1,152 | $547 |
+
+**Cost Savings**:
+- ✅ **Spot instances**: 60-90% discount (may be interrupted)
+- ✅ **Stop when not in use**: Only pay for storage (~$50/month)
+- ✅ **Smaller instances**: Use m6i.4xlarge for demos
+
+## Use Cases
+
+### 1. Sales Demonstrations
+- Show OpenShift IPI installation process
+- Demonstrate Redfish integration
+- Exhibit cluster scaling
+- No physical hardware required
+
+### 2. Customer Training
+- Hands-on IPI installation practice
+- Redfish API interaction
+- BareMetalHost management
+- Troubleshooting workflows
+
+### 3. Development & Testing
+- Test IPI installation procedures
+- Validate automation scripts
+- Development environment for baremetal features
+- CI/CD pipeline testing
+
+### 4. Partner Enablement
+- Train partners on OpenShift IPI
+- Demonstrate Redfish capabilities
+- Practice deployment procedures
+- Pre-sales technical validation
 
 ## Cleanup
 
-To destroy all created resources, use the cleanup playbook:
-
 ```bash
-# Review what will be deleted
-cat cleanup.yml
-
-# Run cleanup (requires confirmation)
+# Delete all AWS resources
 ansible-playbook cleanup.yml -e confirm_deletion=true
 ```
 
-See [CLEANUP.md](CLEANUP.md) for detailed cleanup instructions and manual deletion steps.
-
-**Warning**: This will permanently delete:
+**Warning**: Deletes:
 - EC2 instance
-- All EBS volumes (root, storage, openshift-images)
-- VPC and networking components
-- Security group
-- EC2 key pair
+- All EBS volumes (and data!)
+- VPC and networking
+- Security groups
+- SSH key pair
+
+See [CLEANUP.md](CLEANUP.md) for details.
 
 ## Troubleshooting
 
-### Nested virtualization not enabled
-- Ensure you're using a compatible instance type
-- Verify with `lscpu | grep Virtualization`
+### OpenShift Installation Fails
 
-### Cannot connect to Cockpit
-- Check security group allows port 9090
-- Verify firewall rules: `sudo firewall-cmd --list-all`
+```bash
+# Check installer logs
+ssh ec2-user@<instance-ip>
+cd ~/openshift-install
+./openshift-install wait-for bootstrap-complete --log-level=debug
 
-### VMs won't start
-- Check available resources: `free -h` and `df -h`
-- View libvirt logs: `sudo journalctl -u libvirtd`
-- Check VM logs: `virsh console <vm-name>`
+# Check Redfish connectivity
+curl http://<instance-ip>:8000/redfish/v1/Systems
+```
+
+### VMs Won't Boot
+
+```bash
+# Check VM state
+sudo virsh list --all
+
+# Check Redfish status
+curl http://<instance-ip>:8000/redfish/v1/Systems/<uuid>
+
+# View VM console
+sudo virsh console ocp-master-1
+```
+
+### Nested Virtualization Issues
+
+See [KVM_NESTED_VIRT_FIX.md](KVM_NESTED_VIRT_FIX.md) for:
+- KVM hardware errors
+- VM pausing issues
+- CPU configuration problems
+
+## Security Notes
+
+⚠️ **This is a LAB/DEMO environment** - not for production!
+
+- Default passwords in documentation are examples - **change them**!
+- Security groups allow wide access - **restrict in production**
+- No TLS for Redfish API - **use HTTPS in production**
+- Pull secret contains credentials - **never commit to git**
+
+The repository `.gitignore` protects:
+- `pullsecret.json`
+- SSH keys
+- AWS credentials
+- ISO files and VM images
+
+## Contributing
+
+This is a demonstration environment for OpenShift IPI with Redfish. Contributions welcome for:
+- Additional network configurations
+- Alternative OpenShift deployment methods
+- Documentation improvements
+- Troubleshooting guides
+
+## License
+
+See repository license file.
 
 ## References
 
-- [AWS Nested Virtualization](https://aws.amazon.com/blogs/compute/running-hyper-v-on-amazon-ec2-bare-metal-instances/)
-- [KVM Documentation](https://www.linux-kvm.org/page/Main_Page)
-- [libvirt Documentation](https://libvirt.org/)
+- [OpenShift IPI Documentation](https://docs.openshift.com/container-platform/latest/installing/installing_bare_metal_ipi/ipi-install-overview.html)
+- [Redfish Specification](https://www.dmtf.org/standards/redfish)
+- [Sushy-tools Documentation](https://docs.openstack.org/sushy-tools/latest/)
+- [AWS Nested Virtualization](https://aws.amazon.com/ec2/instance-types/)
+- [KVM Documentation](https://www.linux-kvm.org/)
