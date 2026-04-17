@@ -1,0 +1,155 @@
+---
+- name: Verify OpenShift cluster is accessible
+  ansible.builtin.shell: oc whoami
+  register: oc_check
+  changed_when: false
+  failed_when: false
+  become: true
+  become_user: ec2-user
+
+- name: Fail if OpenShift cluster is not accessible
+  fail:
+    msg: |
+      OpenShift cluster is not accessible. Please ensure:
+      1. OpenShift is installed and running
+      2. kubeconfig is configured at ~/.kube/config
+      3. You can run: oc get nodes
+  when: oc_check.rc != 0
+
+- name: Detect cluster name from infrastructure
+  ansible.builtin.shell: |
+    oc get infrastructure cluster -o jsonpath='{.status.infrastructureName}' | sed 's/-[^-]*$//'
+  register: detected_cluster_name
+  changed_when: false
+  become: true
+  become_user: ec2-user
+
+- name: Detect base domain from cluster
+  ansible.builtin.shell: |
+    oc get dns cluster -o jsonpath='{.spec.baseDomain}'
+  register: detected_base_domain
+  changed_when: false
+  become: true
+  become_user: ec2-user
+
+- name: Set cluster facts from detected values
+  set_fact:
+    ocp_cluster_name: "{{ detected_cluster_name.stdout }}"
+    ocp_base_domain: "{{ detected_base_domain.stdout }}"
+    ec2_instance_ip: "{{ ansible_default_ipv4.address }}"
+
+- name: Display detected cluster information
+  debug:
+    msg:
+      - "Detected OpenShift Cluster:"
+      - "  Cluster Name: {{ ocp_cluster_name }}"
+      - "  Base Domain: {{ ocp_base_domain }}"
+      - "  EC2 Instance IP (BMC): {{ ec2_instance_ip }}"
+
+- name: Check if worker state file exists
+  ansible.builtin.stat:
+    path: "{{ worker_state_file }}"
+  register: state_file_check
+
+- name: Load existing worker state
+  ansible.builtin.slurp:
+    src: "{{ worker_state_file }}"
+  register: worker_state_content
+  when: state_file_check.stat.exists
+
+- name: Parse worker state
+  set_fact:
+    current_workers: "{{ (worker_state_content.content | b64decode | from_json).workers | default([]) }}"
+  when: state_file_check.stat.exists
+
+- name: Initialize worker state if no state file
+  set_fact:
+    current_workers: []
+  when: not state_file_check.stat.exists
+
+- name: Display current worker count
+  debug:
+    msg:
+      - "Current worker count: {{ current_workers | length }}"
+      - "Desired worker count: {{ worker_count }}"
+
+- name: Determine scaling action
+  set_fact:
+    scale_action: "{{ 'up' if (worker_count | int) > (current_workers | length) else ('down' if (worker_count | int) < (current_workers | length) else 'none') }}"
+    workers_to_add: "{{ (worker_count | int) - (current_workers | length) }}"
+    workers_to_remove: "{{ (current_workers | length) - (worker_count | int) }}"
+
+- name: Display scaling action
+  debug:
+    msg:
+      - "Scaling action: {{ scale_action }}"
+      - "{{ 'Workers to add: ' + (workers_to_add | string) if scale_action == 'up' else '' }}"
+      - "{{ 'Workers to remove: ' + (workers_to_remove | string) if scale_action == 'down' else '' }}"
+
+- name: No scaling needed
+  debug:
+    msg: "Cluster already has {{ worker_count }} worker(s). No changes needed."
+  when: scale_action == 'none'
+
+# Scale Up Tasks
+- name: Scale up workers
+  block:
+    - name: Get existing VM names
+      ansible.builtin.shell: virsh list --all --name
+      register: existing_vm_names
+      changed_when: false
+      become: true
+
+    - name: Include scale up tasks
+      include_tasks: scale_up.yml
+      loop: "{{ range(0, workers_to_add | int) | list }}"
+      loop_control:
+        loop_var: worker_index
+        label: "Adding worker {{ worker_index + 1 }}/{{ workers_to_add }}"
+
+  when: scale_action == 'up'
+
+# Scale Down Tasks
+- name: Scale down workers
+  block:
+    - name: Include scale down tasks
+      include_tasks: scale_down.yml
+      loop: "{{ current_workers[-workers_to_remove | int:] }}"
+      loop_control:
+        loop_var: worker_to_remove
+        label: "Removing worker {{ worker_to_remove.name }}"
+
+  when: scale_action == 'down'
+
+- name: Save updated worker state
+  ansible.builtin.copy:
+    content: |
+      {
+        "last_updated": "{{ ansible_date_time.iso8601 }}",
+        "cluster_name": "{{ ocp_cluster_name }}",
+        "base_domain": "{{ ocp_base_domain }}",
+        "worker_count": {{ current_workers | length }},
+        "workers": {{ current_workers | to_nice_json }}
+      }
+    dest: "{{ worker_state_file }}"
+    owner: ec2-user
+    group: ec2-user
+    mode: '0644'
+
+- name: Display final worker status
+  debug:
+    msg:
+      - "=========================================="
+      - "Worker Scaling Complete"
+      - "=========================================="
+      - ""
+      - "Total workers: {{ current_workers | length }}"
+      - ""
+      - "{{ current_workers | map(attribute='name') | list | join(', ') if current_workers | length > 0 else 'No workers configured' }}"
+      - ""
+      - "State file: {{ worker_state_file }}"
+      - ""
+      - "To view workers in cluster:"
+      - "  oc get nodes -l node-role.kubernetes.io/worker"
+      - "  oc get baremetalhosts -n openshift-machine-api"
+      - "=========================================="

@@ -1,0 +1,209 @@
+---
+- name: Find EC2 instance
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    aws_region: us-east-2
+    instance_name: nested-virt-host
+    ssh_private_key_path: "~/.ssh/id_rsa_fips"
+
+  tasks:
+    - name: Find EC2 instance by name
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+          "instance-state-name": ["running"]
+      register: instance_info
+
+    - name: Add EC2 instance to inventory
+      add_host:
+        hostname: "{{ instance_info.instances[0].public_ip_address }}"
+        groupname: nested_virt_hosts
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: "{{ ssh_private_key_path }}"
+
+- name: Diagnose Paused VM Issue
+  hosts: nested_virt_hosts
+  become: true
+  gather_facts: true
+  vars:
+    vm_name: ocp-master-2
+
+  tasks:
+    - name: Get current VM state
+      ansible.builtin.shell: virsh domstate {{ vm_name }}
+      register: vm_state
+      changed_when: false
+
+    - name: Display current state
+      debug:
+        msg: "VM {{ vm_name }} current state: {{ vm_state.stdout }}"
+
+    - name: Get VM CPU configuration
+      ansible.builtin.shell: |
+        virsh dumpxml {{ vm_name }} | grep -A 10 "<cpu"
+      register: cpu_config
+      changed_when: false
+
+    - name: Display CPU configuration
+      debug:
+        msg:
+          - "Current CPU configuration:"
+          - "{{ cpu_config.stdout_lines }}"
+
+    - name: Check QEMU logs for errors (last 100 lines)
+      ansible.builtin.shell: |
+        journalctl -u libvirtd -n 100 | grep -i "{{ vm_name }}" || echo "No recent libvirtd logs for {{ vm_name }}"
+      register: libvirt_logs
+      changed_when: false
+
+    - name: Get QEMU process logs
+      ansible.builtin.shell: |
+        journalctl -t qemu -n 100 | grep -B5 -A5 "{{ vm_name }}" || echo "No QEMU logs found"
+      register: qemu_logs
+      changed_when: false
+      failed_when: false
+
+    - name: Check for KVM errors in system logs
+      ansible.builtin.shell: |
+        journalctl --since "10 minutes ago" | grep -i "kvm" | grep -i "error\|fail\|panic" || echo "No KVM errors in last 10 minutes"
+      register: kvm_errors
+      changed_when: false
+
+    - name: Get VM info from libvirt
+      ansible.builtin.shell: |
+        virsh dominfo {{ vm_name }}
+      register: vm_info
+      changed_when: false
+
+    - name: Check if VM has any error state details
+      ansible.builtin.shell: |
+        virsh qemu-monitor-command {{ vm_name }} --hmp info status || echo "Cannot get monitor status"
+      register: monitor_status
+      changed_when: false
+      failed_when: false
+
+    - name: Get dmesg for KVM/QEMU errors
+      ansible.builtin.shell: |
+        dmesg | tail -100 | grep -i "kvm\|qemu\|{{ vm_name }}" || echo "No recent dmesg entries"
+      register: dmesg_output
+      changed_when: false
+
+    - name: Check nested virtualization status
+      ansible.builtin.shell: |
+        cat /sys/module/kvm_intel/parameters/nested 2>/dev/null || cat /sys/module/kvm_amd/parameters/nested 2>/dev/null || echo "Unknown"
+      register: nested_status
+      changed_when: false
+
+    - name: Get host CPU info
+      ansible.builtin.shell: |
+        lscpu | grep -E "Model name|Virtualization|Hypervisor"
+      register: host_cpu
+      changed_when: false
+
+    - name: Display comprehensive diagnostic report
+      debug:
+        msg:
+          - "=========================================="
+          - "VM Paused Diagnostic Report"
+          - "=========================================="
+          - ""
+          - "VM Name: {{ vm_name }}"
+          - "Current State: {{ vm_state.stdout }}"
+          - ""
+          - "--- VM Information ---"
+          - "{{ vm_info.stdout_lines }}"
+          - ""
+          - "--- CPU Configuration ---"
+          - "{{ cpu_config.stdout_lines }}"
+          - ""
+          - "--- Host CPU Info ---"
+          - "{{ host_cpu.stdout_lines }}"
+          - ""
+          - "--- Nested Virtualization Status ---"
+          - "{{ nested_status.stdout }}"
+          - ""
+          - "--- Monitor Status ---"
+          - "{{ monitor_status.stdout_lines if monitor_status.rc == 0 else ['Unable to query monitor'] }}"
+          - ""
+          - "--- Recent Libvirt Logs ---"
+          - "{{ libvirt_logs.stdout_lines }}"
+          - ""
+          - "--- Recent QEMU Logs ---"
+          - "{{ qemu_logs.stdout_lines }}"
+          - ""
+          - "--- KVM Errors (last 10 min) ---"
+          - "{{ kvm_errors.stdout_lines }}"
+          - ""
+          - "--- Recent dmesg ---"
+          - "{{ dmesg_output.stdout_lines }}"
+          - ""
+          - "=========================================="
+
+    - name: Save diagnostic output to file
+      ansible.builtin.copy:
+        content: |
+          VM Paused Diagnostic Report
+          ============================
+
+          VM Name: {{ vm_name }}
+          Current State: {{ vm_state.stdout }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+
+          VM Information:
+          {{ vm_info.stdout }}
+
+          CPU Configuration:
+          {{ cpu_config.stdout }}
+
+          Host CPU Info:
+          {{ host_cpu.stdout }}
+
+          Nested Virtualization: {{ nested_status.stdout }}
+
+          Monitor Status:
+          {{ monitor_status.stdout }}
+
+          Libvirt Logs:
+          {{ libvirt_logs.stdout }}
+
+          QEMU Logs:
+          {{ qemu_logs.stdout }}
+
+          KVM Errors:
+          {{ kvm_errors.stdout }}
+
+          Dmesg Output:
+          {{ dmesg_output.stdout }}
+        dest: "/home/ec2-user/vm-paused-diagnostic-{{ ansible_date_time.epoch }}.txt"
+        owner: ec2-user
+        group: ec2-user
+        mode: '0644'
+      become: true
+
+    - name: Provide recommendations
+      debug:
+        msg:
+          - "=========================================="
+          - "Next Steps"
+          - "=========================================="
+          - ""
+          - "Diagnostic report saved to:"
+          - "  /home/ec2-user/vm-paused-diagnostic-{{ ansible_date_time.epoch }}.txt"
+          - ""
+          - "To resume the VM (if paused):"
+          - "  sudo virsh resume {{ vm_name }}"
+          - ""
+          - "To restart with current config:"
+          - "  ansible-playbook fix-kvm-hardware-error.yml -e vm_name={{ vm_name }}"
+          - ""
+          - "To check VM console:"
+          - "  sudo virsh console {{ vm_name }}"
+          - "  (Press Ctrl+] to exit)"
+          - ""
+          - "To watch VM state:"
+          - "  watch 'sudo virsh list --all'"
+          - ""
+          - "=========================================="

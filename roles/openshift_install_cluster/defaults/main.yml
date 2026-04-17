@@ -1,0 +1,15 @@
+---
+# OpenShift installation directory
+ocp_install_dir: /home/ec2-user/openshift-install
+
+# Tmux session name for installation
+ocp_tmux_session: openshift-install
+
+# Maximum time to wait for installation (in seconds) - 90 minutes
+ocp_install_timeout: 5400
+
+# Poll interval for checking installation progress (in seconds)
+ocp_poll_interval: 30
+
+# Number of log lines to display during progress updates
+ocp_log_tail_lines: 10

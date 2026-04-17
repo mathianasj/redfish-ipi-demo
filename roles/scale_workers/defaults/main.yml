@@ -1,0 +1,28 @@
+---
+# Desired number of worker nodes
+worker_count: 0
+
+# Worker VM specifications
+worker_vm_memory: 16384  # 16 GB per worker (less than masters)
+worker_vm_vcpus: 4        # 4 vCPUs per worker
+worker_vm_disk_size: 120  # 120 GB disk
+
+# Worker naming
+worker_name_prefix: ocp-worker
+
+# Network configuration
+worker_network_bridge: virbr0
+
+# OpenShift cluster info (will be auto-detected from deployed cluster)
+# ocp_cluster_name: (read from cluster)
+# ocp_base_domain: (read from cluster)
+
+# EC2 instance IP (auto-detected from ansible_default_ipv4)
+# ec2_instance_ip: (auto-detected)
+
+# Worker state tracking file
+worker_state_file: /home/ec2-user/openshift-workers-state.json
+
+# Timeout for deprovisioning (seconds)
+deprovision_timeout: 600
+deprovision_poll_interval: 10

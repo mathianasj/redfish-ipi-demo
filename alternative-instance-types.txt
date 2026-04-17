@@ -1,0 +1,57 @@
+# Alternative Instance Types for nested-virt-host
+# Generated: 2026-04-14T15:34:36Z
+# Current: m8i-flex.16xlarge (64 vCPUs, 256.0 GiB RAM)
+# Current Availability Zone: us-east-2a
+# Region: us-east-2
+# Tested AZs: us-east-2a, us-east-2b, us-east-2c
+# Filter: Nested virtualization support verified, capacity tested across all AZs
+
+## BEST: Alternatives in Current AZ (us-east-2a) - 0 found
+
+
+
+## Alternatives Requiring AZ Change - 0 found
+
+
+## All Alternatives WITH Capacity (0 total)
+
+
+
+## Alternatives WITHOUT Capacity (15 tested)
+
+- m8i.16xlarge: 64 vCPUs, 256.0 GiB RAM - InsufficientInstanceCapacity
+- r8i.16xlarge: 64 vCPUs, 512.0 GiB RAM - InsufficientInstanceCapacity
+- m8i-flex.16xlarge: 64 vCPUs, 256.0 GiB RAM - InsufficientInstanceCapacity
+- r8i-flex.16xlarge: 64 vCPUs, 512.0 GiB RAM - InsufficientInstanceCapacity
+- m8i.24xlarge: 96 vCPUs, 384.0 GiB RAM - InsufficientInstanceCapacity
+- r8i.24xlarge: 96 vCPUs, 768.0 GiB RAM - InsufficientInstanceCapacity
+- m8i.32xlarge: 128 vCPUs, 512.0 GiB RAM - InsufficientInstanceCapacity
+- r8i.32xlarge: 128 vCPUs, 1024.0 GiB RAM - InsufficientInstanceCapacity
+- c8i.32xlarge: 128 vCPUs, 256.0 GiB RAM - InsufficientInstanceCapacity
+- c8i.48xlarge: 192 vCPUs, 384.0 GiB RAM - InsufficientInstanceCapacity
+- r8i.48xlarge: 192 vCPUs, 1536.0 GiB RAM - InsufficientInstanceCapacity
+- m8i.48xlarge: 192 vCPUs, 768.0 GiB RAM - InsufficientInstanceCapacity
+- c8i.96xlarge: 384 vCPUs, 768.0 GiB RAM - InsufficientInstanceCapacity
+- m8i.96xlarge: 384 vCPUs, 1536.0 GiB RAM - InsufficientInstanceCapacity
+- r8i.96xlarge: 384 vCPUs, 3072.0 GiB RAM - InsufficientInstanceCapacity
+
+## Other Suitable Alternatives (0 not tested for capacity)
+
+
+## All Alternatives (15 total)
+
+- m8i.16xlarge: 64 vCPUs, 256.0 GiB RAM, x86_64
+- r8i.16xlarge: 64 vCPUs, 512.0 GiB RAM, x86_64
+- m8i-flex.16xlarge: 64 vCPUs, 256.0 GiB RAM, x86_64
+- r8i-flex.16xlarge: 64 vCPUs, 512.0 GiB RAM, x86_64
+- m8i.24xlarge: 96 vCPUs, 384.0 GiB RAM, x86_64
+- r8i.24xlarge: 96 vCPUs, 768.0 GiB RAM, x86_64
+- m8i.32xlarge: 128 vCPUs, 512.0 GiB RAM, x86_64
+- r8i.32xlarge: 128 vCPUs, 1024.0 GiB RAM, x86_64
+- c8i.32xlarge: 128 vCPUs, 256.0 GiB RAM, x86_64
+- c8i.48xlarge: 192 vCPUs, 384.0 GiB RAM, x86_64
+- r8i.48xlarge: 192 vCPUs, 1536.0 GiB RAM, x86_64
+- m8i.48xlarge: 192 vCPUs, 768.0 GiB RAM, x86_64
+- c8i.96xlarge: 384 vCPUs, 768.0 GiB RAM, x86_64
+- m8i.96xlarge: 384 vCPUs, 1536.0 GiB RAM, x86_64
+- r8i.96xlarge: 384 vCPUs, 3072.0 GiB RAM, x86_64

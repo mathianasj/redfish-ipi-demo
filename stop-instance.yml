@@ -1,0 +1,72 @@
+---
+- name: Stop EC2 instance
+  hosts: localhost
+  gather_facts: false
+  vars:
+    aws_region: us-east-2
+    instance_name: nested-virt-host
+
+  tasks:
+    - name: Find EC2 instance by name tag
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+      register: instance_info
+
+    - name: Fail if instance not found
+      fail:
+        msg: "No instance found with Name tag: {{ instance_name }}"
+      when: instance_info.instances | length == 0
+
+    - name: Set instance facts
+      set_fact:
+        instance_id: "{{ instance_info.instances[0].instance_id }}"
+        instance_state: "{{ instance_info.instances[0].state.name }}"
+        instance_type: "{{ instance_info.instances[0].instance_type }}"
+
+    - name: Display current state
+      debug:
+        msg:
+          - "Instance ID: {{ instance_id }}"
+          - "Instance Type: {{ instance_type }}"
+          - "Current state: {{ instance_state }}"
+
+    - name: Check if already stopped
+      debug:
+        msg: "Instance is already stopped"
+      when: instance_state == "stopped"
+
+    - name: Stop the instance
+      amazon.aws.ec2_instance:
+        instance_ids:
+          - "{{ instance_id }}"
+        region: "{{ aws_region }}"
+        state: stopped
+        wait: true
+        wait_timeout: 300
+      register: stop_result
+      when: instance_state != "stopped"
+
+    - name: Verify instance is stopped
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        instance_ids:
+          - "{{ instance_id }}"
+      register: final_state
+      retries: 10
+      delay: 5
+      until:
+        - final_state.instances | length > 0
+        - final_state.instances[0].state.name == "stopped"
+
+    - name: Display final status
+      debug:
+        msg:
+          - "=========================================="
+          - "Instance Successfully Stopped"
+          - "=========================================="
+          - "Instance ID: {{ instance_id }}"
+          - "State: {{ final_state.instances[0].state.name }}"
+          - ""
+          - "You can now modify the instance type if needed"

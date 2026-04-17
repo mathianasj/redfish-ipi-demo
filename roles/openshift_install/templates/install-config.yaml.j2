@@ -1,0 +1,62 @@
+apiVersion: v1
+baseDomain: {{ ocp_base_domain }}
+metadata:
+  name: {{ ocp_cluster_name }}
+networking:
+  networkType: OVNKubernetes
+  machineNetwork:
+  - cidr: {{ ocp_machine_network_cidr }}
+  clusterNetwork:
+  - cidr: 10.128.0.0/14
+    hostPrefix: 23
+  serviceNetwork:
+  - 172.30.0.0/16
+compute:
+- name: worker
+  replicas: 0
+controlPlane:
+  name: master
+  replicas: 3
+  platform:
+    baremetal: {}
+platform:
+  baremetal:
+    provisioningNetwork: Disabled
+    externalBridge: virbr0
+    apiVIPs:
+    - {{ ocp_api_vip }}
+    ingressVIPs:
+    - {{ ocp_ingress_vip }}
+    hosts:
+    - name: master-1
+      role: master
+      bmc:
+        address: redfish-virtualmedia://{{ ocp_machine_network_gateway }}:8000/redfish/v1/Systems/{{ ocp_master1_redfish_id }}
+        username: admin
+        password: password
+        disableCertificateVerification: true
+      bootMACAddress: "{{ ocp_master1_mac }}"
+      rootDeviceHints:
+        deviceName: "/dev/vda"
+    - name: master-2
+      role: master
+      bmc:
+        address: redfish-virtualmedia://{{ ocp_machine_network_gateway }}:8000/redfish/v1/Systems/{{ ocp_master2_redfish_id }}
+        username: admin
+        password: password
+        disableCertificateVerification: true
+      bootMACAddress: "{{ ocp_master2_mac }}"
+      rootDeviceHints:
+        deviceName: "/dev/vda"
+    - name: master-3
+      role: master
+      bmc:
+        address: redfish-virtualmedia://{{ ocp_machine_network_gateway }}:8000/redfish/v1/Systems/{{ ocp_master3_redfish_id }}
+        username: admin
+        password: password
+        disableCertificateVerification: true
+      bootMACAddress: "{{ ocp_master3_mac }}"
+      rootDeviceHints:
+        deviceName: "/dev/vda"
+pullSecret: '{{ pull_secret }}'
+sshKey: '{{ ssh_public_key }}'

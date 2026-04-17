@@ -1,0 +1,326 @@
+---
+- name: Cleanup and delete EC2 instance and all resources
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    aws_region: us-east-2
+    instance_name: nested-virt-host
+    key_name: nested-virt-key
+    confirm_deletion: false  # Set to true to actually delete resources
+
+  tasks:
+    - name: Safety check - confirm deletion
+      fail:
+        msg: |
+          ============================================
+          WARNING: This will DELETE all resources!
+          ============================================
+
+          This playbook will permanently delete:
+          - EC2 instances: {{ instance_name }} (and any -new variants)
+          - All EBS volumes (root, storage, openshift-images)
+          - Security group
+          - VPC, ALL subnets (3 AZs), route table, internet gateway
+          - EC2 key pair: {{ key_name }}
+          - Any temporary AMIs created during migrations
+
+          To proceed, set confirm_deletion: true in this playbook
+          or run with: -e confirm_deletion=true
+          ============================================
+      when: not confirm_deletion
+
+    - name: Find all related EC2 instances
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}*"
+      register: instance_info
+
+    - name: Display instances to be deleted
+      debug:
+        msg:
+          - "Found {{ instance_info.instances | length }} instance(s) to delete:"
+          - "{{ instance_info.instances | map(attribute='tags.Name') | list }}"
+
+    - name: Get VPC ID from first instance
+      set_fact:
+        vpc_id: "{{ instance_info.instances[0].vpc_id }}"
+      when: instance_info.instances | length > 0
+
+    - name: Collect all instance IDs
+      set_fact:
+        instance_ids_to_delete: "{{ instance_info.instances | map(attribute='instance_id') | list }}"
+      when: instance_info.instances | length > 0
+
+    - name: Terminate all EC2 instances
+      amazon.aws.ec2_instance:
+        region: "{{ aws_region }}"
+        instance_ids: "{{ instance_ids_to_delete }}"
+        state: absent
+        wait: true
+        wait_timeout: 300
+      when: instance_info.instances | length > 0
+      register: instances_terminated
+
+    - name: Wait for instance termination
+      ansible.builtin.pause:
+        seconds: 20
+      when: instances_terminated is changed
+
+    - name: Find storage volume
+      amazon.aws.ec2_vol_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}-storage"
+      register: storage_volume_info
+      ignore_errors: true
+
+    - name: Delete storage volume
+      amazon.aws.ec2_vol:
+        region: "{{ aws_region }}"
+        id: "{{ item.id }}"
+        state: absent
+      loop: "{{ storage_volume_info.volumes }}"
+      when: storage_volume_info.volumes is defined and storage_volume_info.volumes | length > 0
+      ignore_errors: true
+
+    - name: Find OpenShift images volume
+      amazon.aws.ec2_vol_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}-openshift-images"
+      register: ocp_volume_info
+      ignore_errors: true
+
+    - name: Delete OpenShift images volume
+      amazon.aws.ec2_vol:
+        region: "{{ aws_region }}"
+        id: "{{ item.id }}"
+        state: absent
+      loop: "{{ ocp_volume_info.volumes }}"
+      when: ocp_volume_info.volumes is defined and ocp_volume_info.volumes | length > 0
+      ignore_errors: true
+
+    - name: Wait for volumes to be deleted
+      ansible.builtin.pause:
+        seconds: 10
+
+    - name: Find and delete migration snapshots
+      shell: |
+        aws ec2 describe-snapshots \
+          --region {{ aws_region }} \
+          --owner-ids self \
+          --filters "Name=tag:Name,Values={{ instance_name }}-*-migration" \
+          --query 'Snapshots[].SnapshotId' \
+          --output text
+      register: migration_snapshots
+      changed_when: false
+      ignore_errors: true
+
+    - name: Delete migration snapshots
+      shell: |
+        aws ec2 delete-snapshot \
+          --region {{ aws_region }} \
+          --snapshot-id {{ item }}
+      loop: "{{ migration_snapshots.stdout.split() }}"
+      when:
+        - migration_snapshots.stdout is defined
+        - migration_snapshots.stdout != ""
+      ignore_errors: true
+
+    - name: Display migration snapshot cleanup
+      debug:
+        msg: "Deleted {{ migration_snapshots.stdout.split() | default([]) | length }} migration snapshot(s)"
+      when:
+        - migration_snapshots.stdout is defined
+        - migration_snapshots.stdout != ""
+
+    - name: Find temporary migration AMIs with snapshots
+      shell: |
+        aws ec2 describe-images \
+          --region {{ aws_region }} \
+          --owners self \
+          --filters "Name=name,Values={{ instance_name }}-migration-*" \
+          --query 'Images[].[ImageId,BlockDeviceMappings[0].Ebs.SnapshotId]' \
+          --output text
+      register: migration_amis
+      changed_when: false
+      ignore_errors: true
+
+    - name: Parse AMI and snapshot info
+      set_fact:
+        ami_snapshot_pairs: "{{ migration_amis.stdout_lines | default([]) | map('split') | list }}"
+      when:
+        - migration_amis.stdout is defined
+        - migration_amis.stdout != ""
+
+    - name: Delete temporary migration AMIs
+      shell: |
+        aws ec2 deregister-image \
+          --region {{ aws_region }} \
+          --image-id {{ item[0] }}
+      loop: "{{ ami_snapshot_pairs }}"
+      when:
+        - ami_snapshot_pairs is defined
+        - ami_snapshot_pairs | length > 0
+      ignore_errors: true
+
+    - name: Wait for AMIs to deregister
+      pause:
+        seconds: 5
+      when:
+        - ami_snapshot_pairs is defined
+        - ami_snapshot_pairs | length > 0
+
+    - name: Delete orphaned snapshots from migration AMIs
+      shell: |
+        aws ec2 delete-snapshot \
+          --region {{ aws_region }} \
+          --snapshot-id {{ item[1] }}
+      loop: "{{ ami_snapshot_pairs }}"
+      when:
+        - ami_snapshot_pairs is defined
+        - ami_snapshot_pairs | length > 0
+        - item[1] is defined
+        - item[1] != "None"
+      ignore_errors: true
+
+    - name: Display AMI cleanup
+      debug:
+        msg: "Deleted {{ ami_snapshot_pairs | default([]) | length }} temporary migration AMI(s) and their snapshots"
+      when:
+        - ami_snapshot_pairs is defined
+        - ami_snapshot_pairs | length > 0
+
+    - name: Find security group
+      amazon.aws.ec2_security_group_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}-sg"
+      register: sg_info
+
+    - name: Delete security group
+      amazon.aws.ec2_security_group:
+        region: "{{ aws_region }}"
+        group_id: "{{ sg_info.security_groups[0].group_id }}"
+        state: absent
+      when: sg_info.security_groups | length > 0
+      ignore_errors: true
+
+    - name: Find VPC
+      amazon.aws.ec2_vpc_net_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}-vpc"
+      register: vpc_info
+
+    - name: Set VPC ID
+      set_fact:
+        cleanup_vpc_id: "{{ vpc_info.vpcs[0].id }}"
+      when: vpc_info.vpcs | length > 0
+
+    - name: Find all subnets in VPC
+      amazon.aws.ec2_vpc_subnet_info:
+        region: "{{ aws_region }}"
+        filters:
+          vpc-id: "{{ cleanup_vpc_id }}"
+      register: subnet_info
+      when: vpc_info.vpcs | length > 0
+
+    - name: Display subnets to delete
+      debug:
+        msg: "Found {{ subnet_info.subnets | length }} subnet(s) to delete"
+      when:
+        - vpc_info.vpcs | length > 0
+        - subnet_info.subnets is defined
+
+    - name: Find route table
+      amazon.aws.ec2_vpc_route_table_info:
+        region: "{{ aws_region }}"
+        filters:
+          vpc-id: "{{ cleanup_vpc_id }}"
+          "tag:Name": "{{ instance_name }}-rt"
+      register: rt_info
+      when: vpc_info.vpcs | length > 0
+
+    - name: Delete route table
+      amazon.aws.ec2_vpc_route_table:
+        region: "{{ aws_region }}"
+        vpc_id: "{{ cleanup_vpc_id }}"
+        route_table_id: "{{ rt_info.route_tables[0].id }}"
+        lookup: id
+        state: absent
+      when:
+        - vpc_info.vpcs | length > 0
+        - rt_info.route_tables | length > 0
+      ignore_errors: true
+
+    - name: Delete all subnets
+      amazon.aws.ec2_vpc_subnet:
+        region: "{{ aws_region }}"
+        vpc_id: "{{ cleanup_vpc_id }}"
+        cidr: "{{ item.cidr_block }}"
+        state: absent
+      loop: "{{ subnet_info.subnets }}"
+      when:
+        - vpc_info.vpcs | length > 0
+        - subnet_info.subnets is defined
+        - subnet_info.subnets | length > 0
+      loop_control:
+        label: "{{ item.cidr_block }} ({{ item.availability_zone }})"
+      ignore_errors: true
+
+    - name: Find internet gateway
+      amazon.aws.ec2_vpc_igw_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}-igw"
+      register: igw_info
+
+    - name: Detach and delete internet gateway
+      amazon.aws.ec2_vpc_igw:
+        region: "{{ aws_region }}"
+        vpc_id: "{{ cleanup_vpc_id }}"
+        state: absent
+      when:
+        - vpc_info.vpcs | length > 0
+        - igw_info.internet_gateways | length > 0
+      ignore_errors: true
+
+    - name: Delete VPC
+      amazon.aws.ec2_vpc_net:
+        region: "{{ aws_region }}"
+        vpc_id: "{{ cleanup_vpc_id }}"
+        cidr_block: "{{ vpc_info.vpcs[0].cidr_block }}"
+        state: absent
+      when: vpc_info.vpcs | length > 0
+      ignore_errors: true
+
+    - name: Delete EC2 key pair
+      amazon.aws.ec2_key:
+        region: "{{ aws_region }}"
+        name: "{{ key_name }}"
+        state: absent
+
+    - name: Display cleanup summary
+      debug:
+        msg:
+          - "=========================================="
+          - "Cleanup Complete!"
+          - "=========================================="
+          - ""
+          - "Deleted Resources:"
+          - "  - EC2 Instance(s): {{ instance_ids_to_delete | default([]) | length }} instance(s)"
+          - "  - EBS Volumes: {{ (storage_volume_info.volumes | default([]) | length) + (ocp_volume_info.volumes | default([]) | length) }} volume(s)"
+          - "  - Security Group: {{ instance_name }}-sg"
+          - "  - VPC: {{ instance_name }}-vpc"
+          - "  - Subnets: {{ subnet_info.subnets | default([]) | length }} subnet(s) across all AZs"
+          - "  - Route Table, Internet Gateway"
+          - "  - EC2 Key Pair: {{ key_name }}"
+          - "  - Migration Snapshots: {{ migration_snapshots.stdout.split() | default([]) | length }} snapshot(s)"
+          - "  - Temporary AMIs: {{ ami_snapshot_pairs | default([]) | length }} AMI(s)"
+          - "  - AMI Snapshots: {{ ami_snapshot_pairs | default([]) | length }} snapshot(s)"
+          - ""
+          - "All resources have been removed."
+          - "=========================================="

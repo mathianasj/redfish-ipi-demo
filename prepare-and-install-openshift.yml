@@ -1,0 +1,90 @@
+---
+- name: Find EC2 instance
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    aws_region: us-east-2
+    instance_name: nested-virt-host
+    ssh_private_key_path: "~/.ssh/id_rsa_fips"
+
+  tasks:
+    - name: Find EC2 instance by name
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+          "instance-state-name": ["running"]
+      register: instance_info
+
+    - name: Verify instance exists
+      fail:
+        msg: "No running EC2 instance found with name '{{ instance_name }}' in region {{ aws_region }}"
+      when: instance_info.instances | length == 0
+
+    - name: Add EC2 instance to inventory
+      add_host:
+        hostname: "{{ instance_info.instances[0].public_ip_address }}"
+        groupname: nested_virt_hosts
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: "{{ ssh_private_key_path }}"
+
+    - name: Display instance information
+      debug:
+        msg:
+          - "Found EC2 instance: {{ instance_name }}"
+          - "Public IP: {{ instance_info.instances[0].public_ip_address }}"
+          - "Instance ID: {{ instance_info.instances[0].instance_id }}"
+          - "Proceeding with OpenShift preparation and installation..."
+
+- name: Prepare and Install OpenShift Cluster
+  hosts: nested_virt_hosts
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Display workflow overview
+      debug:
+        msg:
+          - "=========================================="
+          - "OpenShift Complete Installation Workflow"
+          - "=========================================="
+          - ""
+          - "Phase 1: Preparation (5-10 minutes)"
+          - "  - Configure DNS records"
+          - "  - Create master VMs"
+          - "  - Generate install-config.yaml"
+          - ""
+          - "Phase 2: Installation (45-60 minutes)"
+          - "  - Run openshift-install in tmux"
+          - "  - Monitor progress"
+          - "  - Configure access"
+          - ""
+          - "Total estimated time: 50-70 minutes"
+          - "=========================================="
+
+  roles:
+    - role: openshift_install
+      tags: ['prepare']
+
+    - role: openshift_install_cluster
+      tags: ['install']
+
+  post_tasks:
+    - name: Display completion summary
+      debug:
+        msg:
+          - "=========================================="
+          - "✓ OpenShift Complete Installation Finished"
+          - "=========================================="
+          - ""
+          - "Your OpenShift cluster is now ready!"
+          - ""
+          - "Access information saved to:"
+          - "  /home/ec2-user/openshift-cluster-access.txt"
+          - ""
+          - "Quick access:"
+          - "  ssh ec2-user@{{ ansible_host }}"
+          - "  cat ~/openshift-cluster-access.txt"
+          - ""
+          - "=========================================="

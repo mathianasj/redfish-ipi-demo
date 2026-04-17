@@ -1,0 +1,61 @@
+---
+# Test if a specific instance type has available capacity across multiple AZs
+
+- name: Display testing message
+  debug:
+    msg: "Testing capacity for {{ test_type }} across {{ az_subnet_map | length }} availability zones..."
+
+- name: Initialize AZ results for this instance type
+  set_fact:
+    azs_with_capacity: []
+    azs_without_capacity: []
+
+- name: Test capacity in each availability zone
+  block:
+    - name: Attempt dry-run launch in this AZ
+      shell: |
+        aws ec2 run-instances \
+          --region {{ aws_region }} \
+          --instance-type {{ test_type }} \
+          --image-id {{ ami_id }} \
+          --subnet-id {{ az_subnet_map[item] }} \
+          --dry-run \
+          2>&1
+      register: dryrun_result
+      failed_when: false
+      changed_when: false
+      loop: "{{ az_subnet_map | dict2items | map(attribute='key') | list }}"
+
+    - name: Parse results for each AZ
+      set_fact:
+        azs_with_capacity: "{{ azs_with_capacity + [item.item] }}"
+      loop: "{{ dryrun_result.results }}"
+      when: "'DryRunOperation' in item.stdout"
+
+    - name: Parse failures for each AZ
+      set_fact:
+        azs_without_capacity: "{{ azs_without_capacity + [item.item] }}"
+      loop: "{{ dryrun_result.results }}"
+      when: "'InsufficientInstanceCapacity' in item.stdout"
+
+- name: Store capacity results by AZ
+  set_fact:
+    instance_capacity_by_az: "{{ instance_capacity_by_az | combine({test_type: {'with_capacity': azs_with_capacity, 'without_capacity': azs_without_capacity}}) }}"
+
+- name: Display test result
+  debug:
+    msg: "{{ test_type }}: {{ azs_with_capacity | length }}/{{ az_subnet_map | length }} AZs have capacity {% if azs_with_capacity | length > 0 %}({{ azs_with_capacity | join(', ') }}){% endif %}"
+
+- name: Add to available list if any AZ has capacity
+  set_fact:
+    available_with_capacity: "{{ available_with_capacity | default([]) + [test_type] }}"
+  when: azs_with_capacity | length > 0
+
+- name: Add to unavailable list if no AZ has capacity
+  set_fact:
+    unavailable_capacity: "{{ unavailable_capacity | default([]) + [test_type] }}"
+  when: azs_with_capacity | length == 0
+
+- name: Pause between instance type tests to avoid rate limiting
+  pause:
+    seconds: 2

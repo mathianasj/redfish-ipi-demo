@@ -1,0 +1,17 @@
+# Example Ansible Inventory File
+# This file shows how to manually define the inventory if needed
+# The playbooks automatically discover the EC2 instance, so this is optional
+
+[nested_virt_hosts]
+# Replace with your EC2 instance public IP
+3.145.123.45 ansible_user=ec2-user ansible_ssh_private_key_file=~/.ssh/id_rsa_fips
+
+# To use this inventory:
+# ansible-playbook configure-dns.yml -i inventory.example
+
+# To create your own inventory dynamically:
+# export INSTANCE_IP=<your-instance-public-ip>
+# cat > inventory <<EOF
+# [nested_virt_hosts]
+# $INSTANCE_IP ansible_user=ec2-user ansible_ssh_private_key_file=~/.ssh/id_rsa_fips
+# EOF

@@ -1,0 +1,153 @@
+---
+# Scale up tasks - adds a single worker
+- name: Calculate next worker number
+  set_fact:
+    next_worker_number: "{{ (current_workers | map(attribute='number') | map('int') | max | default(0)) + 1 + worker_index }}"
+    worker_name: "{{ worker_name_prefix }}-{{ (current_workers | map(attribute='number') | map('int') | max | default(0)) + 1 + worker_index }}"
+
+- name: Check if worker VM already exists
+  set_fact:
+    worker_vm_exists: "{{ worker_name in existing_vm_names.stdout_lines }}"
+
+- name: Generate random MAC address for worker
+  set_fact:
+    worker_mac: "52:54:00:{{ '%02x:%02x:%02x' | format(range(0, 256) | random, range(0, 256) | random, range(0, 256) | random) }}"
+  when: not worker_vm_exists
+
+- name: Create worker VM
+  ansible.builtin.shell: |
+    virt-install \
+      --name {{ worker_name }} \
+      --memory {{ worker_vm_memory }} \
+      --vcpus {{ worker_vm_vcpus }} \
+      --cpu kvm64 \
+      --disk size={{ worker_vm_disk_size }},format=qcow2,bus=virtio \
+      --network bridge={{ worker_network_bridge }},mac={{ worker_mac }} \
+      --boot uefi,network \
+      --graphics vnc \
+      --noautoconsole \
+      --os-variant rhel9.0 \
+      --events on_crash=restart \
+      --noreboot
+  when: not worker_vm_exists
+  become: true
+  register: vm_create_result
+
+- name: Fix worker VM CPU to disable VMX (prevent KVM errors)
+  ansible.builtin.shell: |
+    # Export current XML
+    virsh dumpxml {{ worker_name }} > /tmp/{{ worker_name }}-cpu-fix.xml
+
+    # Remove existing CPU section
+    sed -i '/<cpu.*>/,/<\/cpu>/d' /tmp/{{ worker_name }}-cpu-fix.xml
+
+    # Add kvm64 with VMX disabled
+    sed -i 's|<clock|  <cpu mode="custom" match="exact" check="none">\n    <model fallback="allow">kvm64</model>\n    <feature policy="disable" name="vmx"/>\n  </cpu>\n  <clock|' /tmp/{{ worker_name }}-cpu-fix.xml
+
+    # Apply via virsh define
+    virsh define /tmp/{{ worker_name }}-cpu-fix.xml
+
+    # Clean up
+    rm -f /tmp/{{ worker_name }}-cpu-fix.xml
+  when: vm_create_result is changed
+  become: true
+
+- name: Wait for VM to be defined
+  ansible.builtin.pause:
+    seconds: 3
+  when: vm_create_result is changed
+
+- name: Get worker VM UUID
+  ansible.builtin.shell: virsh domuuid {{ worker_name }}
+  register: worker_uuid_result
+  changed_when: false
+  become: true
+
+- name: Set worker UUID
+  set_fact:
+    worker_uuid: "{{ worker_uuid_result.stdout }}"
+
+- name: Get worker MAC address if VM already existed
+  ansible.builtin.shell: |
+    virsh dumpxml {{ worker_name }} | grep "mac address" | head -1 | sed "s/.*'\(.*\)'.*/\1/"
+  register: existing_mac_result
+  changed_when: false
+  become: true
+  when: worker_vm_exists
+
+- name: Set MAC address from existing VM
+  set_fact:
+    worker_mac: "{{ existing_mac_result.stdout }}"
+  when: worker_vm_exists
+
+- name: Display worker VM information
+  debug:
+    msg:
+      - "Worker VM: {{ worker_name }}"
+      - "  UUID: {{ worker_uuid }}"
+      - "  MAC: {{ worker_mac }}"
+      - "  Memory: {{ worker_vm_memory }} MB"
+      - "  vCPUs: {{ worker_vm_vcpus }}"
+      - "  Disk: {{ worker_vm_disk_size }} GB"
+      - "  BMC: redfish-virtualmedia://{{ ec2_instance_ip }}:8000/redfish/v1/Systems/{{ worker_uuid }}"
+
+- name: Create BareMetalHost manifest from template
+  ansible.builtin.template:
+    src: baremetalhost.yaml.j2
+    dest: /tmp/baremetalhost-{{ worker_name }}.yaml
+    owner: ec2-user
+    group: ec2-user
+    mode: '0644'
+  vars:
+    bmh_name: "{{ worker_name }}"
+    bmh_mac: "{{ worker_mac }}"
+    bmh_bmc_address: "redfish-virtualmedia://{{ ec2_instance_ip }}:8000/redfish/v1/Systems/{{ worker_uuid }}"
+
+- name: Apply BareMetalHost resource to cluster
+  ansible.builtin.shell: |
+    oc apply -f /tmp/baremetalhost-{{ worker_name }}.yaml
+  register: bmh_apply_result
+  become: true
+  become_user: ec2-user
+
+- name: Display BareMetalHost creation result
+  debug:
+    msg: "{{ bmh_apply_result.stdout_lines }}"
+
+- name: Wait for BareMetalHost to be discovered
+  ansible.builtin.shell: |
+    oc get baremetalhost {{ worker_name }} -n openshift-machine-api -o jsonpath='{.status.provisioning.state}'
+  register: bmh_state
+  until: bmh_state.stdout in ['available', 'provisioning', 'provisioned']
+  retries: 30
+  delay: 10
+  changed_when: false
+  become: true
+  become_user: ec2-user
+  failed_when: false
+
+- name: Add worker to state tracking
+  set_fact:
+    current_workers: "{{ current_workers + [new_worker] }}"
+  vars:
+    new_worker:
+      name: "{{ worker_name }}"
+      number: "{{ next_worker_number }}"
+      uuid: "{{ worker_uuid }}"
+      mac: "{{ worker_mac }}"
+      bmc_address: "redfish-virtualmedia://{{ ec2_instance_ip }}:8000/redfish/v1/Systems/{{ worker_uuid }}"
+      created: "{{ ansible_date_time.iso8601 }}"
+      memory_mb: "{{ worker_vm_memory }}"
+      vcpus: "{{ worker_vm_vcpus }}"
+      disk_gb: "{{ worker_vm_disk_size }}"
+
+- name: Clean up temporary manifest file
+  ansible.builtin.file:
+    path: /tmp/baremetalhost-{{ worker_name }}.yaml
+    state: absent
+
+- name: Display worker addition success
+  debug:
+    msg:
+      - "✓ Worker {{ worker_name }} added successfully"
+      - "  BareMetalHost state: {{ bmh_state.stdout }}"

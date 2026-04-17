@@ -1,0 +1,207 @@
+---
+- name: Migrate to available instance type with nested virtualization
+  hosts: localhost
+  gather_facts: false
+  vars:
+    aws_region: us-east-2
+    instance_name: nested-virt-host
+    max_cpu_increase_percent: 25  # Maximum % increase in vCPUs
+    max_memory_increase_percent: 25  # Maximum % increase in memory
+    max_attempts: 10  # How many instance types to try
+
+  tasks:
+    - name: Find existing EC2 instance
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+      register: instance_info
+
+    - name: Fail if instance not found
+      fail:
+        msg: "No instance found with Name tag: {{ instance_name }}"
+      when: instance_info.instances | length == 0
+
+    - name: Set current instance facts
+      set_fact:
+        instance_id: "{{ instance_info.instances[0].instance_id }}"
+        current_instance_type: "{{ instance_info.instances[0].instance_type }}"
+        current_state: "{{ instance_info.instances[0].state.name }}"
+        availability_zone: "{{ instance_info.instances[0].placement.availability_zone }}"
+        subnet_id: "{{ instance_info.instances[0].subnet_id }}"
+        ami_id: "{{ instance_info.instances[0].image_id }}"
+        current_cpu_options: "{{ instance_info.instances[0].cpu_options }}"
+
+    - name: Display current instance info
+      debug:
+        msg:
+          - "=========================================="
+          - "Current Instance Configuration"
+          - "=========================================="
+          - "Instance ID: {{ instance_id }}"
+          - "Instance Type: {{ current_instance_type }}"
+          - "State: {{ current_state }}"
+          - "Availability Zone: {{ availability_zone }}"
+
+    - name: Get current instance specs
+      shell: |
+        aws ec2 describe-instance-types \
+          --region {{ aws_region }} \
+          --instance-types {{ current_instance_type }} \
+          --query 'InstanceTypes[0].[VCpuInfo.DefaultVCpus, MemoryInfo.SizeInMiB]' \
+          --output text
+      register: current_specs
+      changed_when: false
+
+    - name: Parse current specs
+      set_fact:
+        current_vcpus: "{{ current_specs.stdout.split()[0] | int }}"
+        current_memory_mib: "{{ current_specs.stdout.split()[1] | int }}"
+        max_vcpus: "{{ (current_specs.stdout.split()[0] | int * (1 + max_cpu_increase_percent / 100)) | int }}"
+        max_memory_mib: "{{ (current_specs.stdout.split()[1] | int * (1 + max_memory_increase_percent / 100)) | int }}"
+
+    - name: Display search criteria
+      debug:
+        msg:
+          - "Current specs: {{ current_vcpus }} vCPUs, {{ (current_memory_mib / 1024) | round(1) }} GiB RAM"
+          - "Maximum allowed: {{ max_vcpus }} vCPUs, {{ (max_memory_mib / 1024) | round(1) }} GiB RAM"
+          - "Constraint: ≤{{ max_cpu_increase_percent }}% CPU increase, ≤{{ max_memory_increase_percent }}% RAM increase"
+
+    - name: Get all instance types in availability zone
+      shell: |
+        aws ec2 describe-instance-type-offerings \
+          --region {{ aws_region }} \
+          --location-type availability-zone \
+          --filters Name=location,Values={{ availability_zone }} \
+          --query 'InstanceTypeOfferings[].InstanceType' \
+          --output text
+      register: available_types
+      changed_when: false
+
+    - name: Convert to list
+      set_fact:
+        available_types_list: "{{ available_types.stdout.split() }}"
+
+    - name: Get details for all instance types
+      shell: |
+        aws ec2 describe-instance-types \
+          --region {{ aws_region }} \
+          --instance-types {{ available_types_list | join(' ') }} \
+          --query 'InstanceTypes[?ProcessorInfo.SupportedFeatures!=`null` && contains(ProcessorInfo.SupportedFeatures, `nested-virtualization`)].{Type:InstanceType, VCpus:VCpuInfo.DefaultVCpus, Memory:MemoryInfo.SizeInMiB, Arch:ProcessorInfo.SupportedArchitectures[0]}' \
+          --output json
+      register: instance_types_result
+      changed_when: false
+
+    - name: Parse instance types
+      set_fact:
+        all_instance_types: "{{ instance_types_result.stdout | from_json }}"
+
+    - name: Filter and sort candidates
+      set_fact:
+        candidate_types: "{{ all_instance_types |
+          selectattr('VCpus', '>=', current_vcpus) |
+          selectattr('Memory', '>=', current_memory_mib) |
+          selectattr('VCpus', '<=', max_vcpus) |
+          selectattr('Memory', '<=', max_memory_mib) |
+          rejectattr('Type', 'search', '\\.metal') |
+          rejectattr('Type', 'equalto', current_instance_type) |
+          list }}"
+
+    - name: Add increase calculations
+      set_fact:
+        candidates_with_scores: "{{ candidates_with_scores | default([]) + [item | combine({'cpu_increase': ((item.VCpus - current_vcpus) | float / current_vcpus * 100), 'memory_increase': ((item.Memory - current_memory_mib) | float / current_memory_mib * 100), 'total_increase': ((item.VCpus - current_vcpus) | float / current_vcpus * 100) + ((item.Memory - current_memory_mib) | float / current_memory_mib * 100)})] }}"
+      loop: "{{ candidate_types }}"
+
+    - name: Sort by total increase (smallest first)
+      set_fact:
+        sorted_candidates: "{{ candidates_with_scores | sort(attribute='total_increase') }}"
+
+    - name: Display candidates
+      debug:
+        msg:
+          - "=========================================="
+          - "Found {{ sorted_candidates | length }} candidates within constraints"
+          - "Will try up to {{ [max_attempts, sorted_candidates | length] | min }} instance types"
+          - "=========================================="
+
+    - name: Show top candidates
+      debug:
+        msg:
+          - "{{ loop.index }}. {{ item.Type }}: {{ item.VCpus }} vCPUs (+{{ item.cpu_increase | round(1) }}%), {{ (item.Memory / 1024) | round(1) }} GiB (+{{ item.memory_increase | round(1) }}%)"
+      loop: "{{ sorted_candidates[:max_attempts] }}"
+      loop_control:
+        label: "{{ item.Type }}"
+
+    - name: Fail if no candidates found
+      fail:
+        msg: "No instance types found that meet the criteria (nested-virt support, ≤{{ max_cpu_increase_percent }}% increases)"
+      when: sorted_candidates | length == 0
+
+    - name: Stop instance if running
+      amazon.aws.ec2_instance:
+        instance_ids:
+          - "{{ instance_id }}"
+        state: stopped
+        region: "{{ aws_region }}"
+        wait: true
+        wait_timeout: 300
+      when: current_state == "running"
+
+    - name: Wait for instance to be fully stopped
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        instance_ids:
+          - "{{ instance_id }}"
+      register: stopped_check
+      retries: 30
+      delay: 5
+      until: stopped_check.instances[0].state.name == "stopped"
+
+    - name: Initialize migration tracking
+      set_fact:
+        migration_successful: false
+        successful_type: ""
+        attempts_made: 0
+
+    - name: Attempt migration to each candidate
+      include_tasks: attempt_instance_migration.yml
+      loop: "{{ sorted_candidates[:max_attempts] }}"
+      loop_control:
+        loop_var: candidate
+      when: not migration_successful
+
+    - name: Handle migration failure
+      debug:
+        msg:
+          - "=========================================="
+          - "MIGRATION FAILED"
+          - "=========================================="
+          - "Tried {{ attempts_made }} instance types, none had available capacity"
+          - "Instance remains as {{ current_instance_type }} in stopped state"
+          - "Recommendations:"
+          - "  - Wait and try again later (capacity changes frequently)"
+          - "  - Increase max_cpu_increase_percent or max_memory_increase_percent"
+          - "  - Try a different availability zone"
+      when: not migration_successful
+
+    - name: Start original instance if migration failed
+      amazon.aws.ec2_instance:
+        instance_ids:
+          - "{{ instance_id }}"
+        state: started
+        region: "{{ aws_region }}"
+        wait: true
+        wait_timeout: 300
+      when: not migration_successful and current_state == "running"
+
+    - name: Display success
+      debug:
+        msg:
+          - "=========================================="
+          - "MIGRATION SUCCESSFUL!"
+          - "=========================================="
+          - "Previous: {{ current_instance_type }} ({{ current_vcpus }} vCPUs, {{ (current_memory_mib / 1024) | round(1) }} GiB)"
+          - "New: {{ successful_type }}"
+          - "Instance is now running in {{ availability_zone }}"
+          - "=========================================="
+      when: migration_successful

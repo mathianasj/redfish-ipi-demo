@@ -1,0 +1,314 @@
+---
+- name: Find alternative instance types with nested virtualization support
+  hosts: localhost
+  gather_facts: false
+  vars:
+    aws_region: us-east-2
+    instance_name: nested-virt-host
+    max_capacity_tests: 30  # Limit capacity testing to avoid long run times
+    max_cpu_increase_percent: 50  # Maximum % increase in vCPUs
+    max_memory_increase_percent: 50  # Maximum % increase in memory
+    attempt_migration: true  # Set to false to only find alternatives without migrating
+    try_other_azs: true  # Try migrating to other AZs if current AZ has no capacity
+
+  tasks:
+    - name: Find existing EC2 instance
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+      register: instance_info
+
+    - name: Fail if instance not found
+      fail:
+        msg: "No instance found with Name tag: {{ instance_name }}"
+      when: instance_info.instances | length == 0
+
+    - name: Set current instance facts
+      set_fact:
+        instance_id: "{{ instance_info.instances[0].instance_id }}"
+        current_instance_type: "{{ instance_info.instances[0].instance_type }}"
+        availability_zone: "{{ instance_info.instances[0].placement.availability_zone }}"
+        current_cpu_options: "{{ instance_info.instances[0].cpu_options }}"
+        subnet_id: "{{ instance_info.instances[0].subnet_id }}"
+        ami_id: "{{ instance_info.instances[0].image_id }}"
+
+    - name: Display current instance information
+      debug:
+        msg:
+          - "Current Instance ID: {{ instance_id }}"
+          - "Current Instance Type: {{ current_instance_type }}"
+          - "Availability Zone: {{ availability_zone }}"
+          - "CPU Cores: {{ current_cpu_options.core_count }}"
+          - "Threads per Core: {{ current_cpu_options.threads_per_core }}"
+          - "Total vCPUs: {{ current_cpu_options.core_count * current_cpu_options.threads_per_core }}"
+
+    - name: Get detailed specs for current instance type
+      shell: |
+        aws ec2 describe-instance-types \
+          --region {{ aws_region }} \
+          --instance-types {{ current_instance_type }} \
+          --query 'InstanceTypes[0].[VCpuInfo.DefaultVCpus, MemoryInfo.SizeInMiB]' \
+          --output text
+      register: current_specs
+      changed_when: false
+
+    - name: Parse current instance specs
+      set_fact:
+        current_vcpus: "{{ current_specs.stdout.split()[0] | int }}"
+        current_memory_mib: "{{ current_specs.stdout.split()[1] | int }}"
+        max_vcpus: "{{ (current_specs.stdout.split()[0] | int * (1 + max_cpu_increase_percent / 100)) | int }}"
+        max_memory_mib: "{{ (current_specs.stdout.split()[1] | int * (1 + max_memory_increase_percent / 100)) | int }}"
+
+    - name: Display current instance requirements
+      debug:
+        msg:
+          - "Current vCPUs: {{ current_vcpus }}"
+          - "Current Memory: {{ (current_memory_mib / 1024) | round(1) }} GiB"
+          - "Maximum allowed: {{ max_vcpus }} vCPUs, {{ (max_memory_mib / 1024) | round(1) }} GiB"
+          - "Constraint: ≤{{ max_cpu_increase_percent }}% CPU increase, ≤{{ max_memory_increase_percent }}% RAM increase"
+          - "Filtering for nested virtualization support"
+
+    - name: Get all availability zones in region
+      shell: |
+        aws ec2 describe-availability-zones \
+          --region {{ aws_region }} \
+          --filters Name=state,Values=available \
+          --query 'AvailabilityZones[].ZoneName' \
+          --output text
+      register: all_azs_result
+      changed_when: false
+      when: try_other_azs
+
+    - name: Set AZ list
+      set_fact:
+        all_availability_zones: "{{ all_azs_result.stdout.split() if try_other_azs else [availability_zone] }}"
+
+    - name: Get subnets for each AZ
+      shell: |
+        aws ec2 describe-subnets \
+          --region {{ aws_region }} \
+          --filters "Name=availability-zone,Values={{ item }}" "Name=vpc-id,Values={{ instance_info.instances[0].vpc_id }}" \
+          --query 'Subnets[0].SubnetId' \
+          --output text
+      register: subnet_lookup
+      loop: "{{ all_availability_zones }}"
+      changed_when: false
+
+    - name: Build AZ to subnet mapping
+      set_fact:
+        az_subnet_map: "{{ az_subnet_map | default({}) | combine({item.item: item.stdout}) }}"
+      loop: "{{ subnet_lookup.results }}"
+      when: item.stdout != "None" and item.stdout != ""
+
+    - name: Display AZ info
+      debug:
+        msg:
+          - "Will search in {{ az_subnet_map | length }} availability zone(s)"
+          - "Current AZ: {{ availability_zone }}"
+          - "{% if try_other_azs %}Also trying: {{ az_subnet_map.keys() | difference([availability_zone]) | join(', ') }}{% endif %}"
+
+    - name: Get all instance types available in the region
+      shell: |
+        aws ec2 describe-instance-type-offerings \
+          --region {{ aws_region }} \
+          --location-type region \
+          --query 'InstanceTypeOfferings[].InstanceType' \
+          --output text
+      register: available_types
+      changed_when: false
+
+    - name: Convert available types to list
+      set_fact:
+        available_types_list: "{{ available_types.stdout.split() | unique | list }}"
+
+    - name: Display instance count
+      debug:
+        msg: "Found {{ available_types_list | length }} instance types in {{ availability_zone }}, querying for nested virtualization support..."
+
+    - name: Initialize candidate types list
+      set_fact:
+        all_candidate_types: []
+
+    - name: Query instance types in batches of 100
+      include_tasks: query_nested_virt_batch.yml
+      loop: "{{ range(0, available_types_list | length, 100) | list }}"
+      loop_control:
+        loop_var: batch_start
+
+    - name: Filter instances that meet CPU and memory requirements and exclude bare metal
+      set_fact:
+        filtered_types: "{{ all_candidate_types |
+          selectattr('1', '>=', current_vcpus) |
+          selectattr('2', '>=', current_memory_mib) |
+          selectattr('1', '<=', max_vcpus) |
+          selectattr('2', '<=', max_memory_mib) |
+          rejectattr('0', 'search', '\\.metal') |
+          rejectattr('0', 'equalto', current_instance_type) |
+          list }}"
+
+    - name: Add increase calculations
+      set_fact:
+        alternatives_with_scores: []
+
+    - name: Calculate increase percentages
+      set_fact:
+        alternatives_with_scores: "{{ alternatives_with_scores + [[item[0], item[1], item[2], item[3], ((item[1] - current_vcpus) | float / current_vcpus * 100), ((item[2] - current_memory_mib) | float / current_memory_mib * 100), ((item[1] - current_vcpus) | float / current_vcpus * 100) + ((item[2] - current_memory_mib) | float / current_memory_mib * 100)]] }}"
+      loop: "{{ filtered_types }}"
+
+    - name: Sort by total increase (smallest first)
+      set_fact:
+        sorted_alternatives: "{{ alternatives_with_scores | sort(attribute='6') }}"
+
+    - name: Display candidates found
+      debug:
+        msg:
+          - "Found {{ sorted_alternatives | length }} instance types within constraints"
+          - "{% if attempt_migration %}Will attempt migration to instance types (smallest increase first){% else %}Migration disabled - showing alternatives only{% endif %}"
+
+    - name: Display top candidates
+      debug:
+        msg: "{{ idx + 1 }}. {{ item[0] }}: {{ item[1] }} vCPUs (+{{ item[4] | round(1) }}%), {{ (item[2] / 1024) | round(1) }} GiB (+{{ item[5] | round(1) }}%)"
+      loop: "{{ sorted_alternatives[:10] }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item[0] }}"
+      when: sorted_alternatives | length > 0
+
+    - name: Fail if no candidates found
+      fail:
+        msg: "No instance types found within constraints (≤{{ max_cpu_increase_percent }}% CPU, ≤{{ max_memory_increase_percent }}% RAM increases)"
+      when: sorted_alternatives | length == 0
+
+    - name: Stop instance if attempting migration
+      amazon.aws.ec2_instance:
+        instance_ids:
+          - "{{ instance_id }}"
+        state: stopped
+        region: "{{ aws_region }}"
+        wait: true
+        wait_timeout: 300
+      when:
+        - attempt_migration
+        - instance_info.instances[0].state.name == "running"
+
+    - name: Wait for instance to be fully stopped
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        instance_ids:
+          - "{{ instance_id }}"
+      register: stopped_check
+      retries: 30
+      delay: 5
+      until: stopped_check.instances[0].state.name == "stopped"
+      when: attempt_migration
+
+    - name: Initialize migration tracking
+      set_fact:
+        migration_successful: false
+        successful_type: ""
+        successful_az: ""
+        attempts_made: 0
+        migration_attempts: []
+      when: attempt_migration
+
+    - name: Build migration attempt list (current AZ first, then others)
+      set_fact:
+        migration_attempts: "{{ migration_attempts + [{'type': item, 'az': availability_zone, 'subnet': az_subnet_map[availability_zone]}] }}"
+      loop: "{{ sorted_alternatives[:max_capacity_tests] }}"
+      when: attempt_migration
+
+    - name: Add attempts for other AZs
+      set_fact:
+        migration_attempts: "{{ migration_attempts + [{'type': item[0], 'az': item[1], 'subnet': az_subnet_map[item[1]]}] }}"
+      loop: "{{ sorted_alternatives[:max_capacity_tests] | product(az_subnet_map.keys() | difference([availability_zone]) | list) | list }}"
+      when:
+        - attempt_migration
+        - try_other_azs
+        - az_subnet_map.keys() | length > 1
+
+    - name: Display migration plan
+      debug:
+        msg:
+          - "Will attempt {{ migration_attempts | length }} migrations:"
+          - "  - {{ sorted_alternatives[:max_capacity_tests] | length }} instance types in current AZ ({{ availability_zone }})"
+          - "{% if try_other_azs and az_subnet_map.keys() | length > 1 %}  - Same types in {{ az_subnet_map.keys() | difference([availability_zone]) | length }} other AZ(s){% endif %}"
+      when: attempt_migration
+
+    - name: Attempt migration to each candidate
+      include_tasks: attempt_instance_type_change_with_az.yml
+      loop: "{{ migration_attempts }}"
+      loop_control:
+        loop_var: migration_attempt
+      when:
+        - attempt_migration
+        - not migration_successful
+
+    - name: Handle migration failure
+      debug:
+        msg:
+          - "=========================================="
+          - "MIGRATION FAILED"
+          - "=========================================="
+          - "Tried {{ attempts_made }} instance types, none had available capacity"
+          - "Instance remains as {{ current_instance_type }} in stopped state"
+          - "Recommendations:"
+          - "  - Wait and try again later"
+          - "  - Increase max_cpu_increase_percent or max_memory_increase_percent"
+          - "  - Run: ansible-playbook start-instance.yml (to restart original)"
+      when:
+        - attempt_migration
+        - not migration_successful
+
+    - name: Start original instance if migration failed
+      amazon.aws.ec2_instance:
+        instance_ids:
+          - "{{ instance_id }}"
+        state: started
+        region: "{{ aws_region }}"
+        wait: true
+        wait_timeout: 300
+      when:
+        - attempt_migration
+        - not migration_successful
+        - instance_info.instances[0].state.name == "running"
+
+    - name: Display success
+      debug:
+        msg:
+          - "=========================================="
+          - "MIGRATION SUCCESSFUL!"
+          - "=========================================="
+          - "Previous: {{ current_instance_type }} ({{ current_vcpus }} vCPUs, {{ (current_memory_mib / 1024) | round(1) }} GiB) in {{ availability_zone }}"
+          - "New: {{ successful_type }} in {{ successful_az }}"
+          - "{% if successful_az != availability_zone %}NOTE: Instance moved to different availability zone!{% endif %}"
+          - "Instance is now running"
+          - "=========================================="
+      when:
+        - attempt_migration
+        - migration_successful
+
+
+    - name: Save alternatives summary to file (if not migrating)
+      copy:
+        content: |
+          # Alternative Instance Types for {{ instance_name }}
+          # Generated: {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}
+          # Current: {{ current_instance_type }} ({{ current_vcpus }} vCPUs, {{ (current_memory_mib / 1024) | round(1) }} GiB RAM)
+          # Availability Zone: {{ availability_zone }}
+          # Region: {{ aws_region }}
+          # Constraints: ≤{{ max_cpu_increase_percent }}% CPU, ≤{{ max_memory_increase_percent }}% RAM
+
+          ## Top {{ sorted_alternatives[:20] | length }} Alternatives (sorted by smallest increase)
+
+          {% for type in sorted_alternatives[:20] %}
+          {{ loop.index }}. {{ type[0] }}
+             - vCPUs: {{ type[1] }} (+{{ type[4] | round(1) }}%)
+             - Memory: {{ (type[2] / 1024) | round(1) }} GiB (+{{ type[5] | round(1) }}%)
+             - Total increase: {{ type[6] | round(1) }}%
+
+          {% endfor %}
+        dest: "./alternative-instance-types.txt"
+      when:
+        - sorted_alternatives | length > 0
+        - not attempt_migration

@@ -1,0 +1,346 @@
+---
+- name: Check if install-config.yaml exists
+  ansible.builtin.stat:
+    path: "{{ ocp_install_dir }}/install-config.yaml"
+  register: install_config_check
+
+- name: Fail if install-config.yaml doesn't exist
+  fail:
+    msg: |
+      install-config.yaml not found at {{ ocp_install_dir }}/install-config.yaml
+
+      Please run the prepare_openshift role first to generate the configuration.
+  when: not install_config_check.stat.exists
+
+- name: Check if cluster is already installed
+  ansible.builtin.stat:
+    path: "{{ ocp_install_dir }}/auth/kubeconfig"
+  register: kubeconfig_check
+
+- name: Display cluster already installed message
+  debug:
+    msg:
+      - "=========================================="
+      - "OpenShift cluster appears to be already installed!"
+      - "Kubeconfig found at: {{ ocp_install_dir }}/auth/kubeconfig"
+      - "=========================================="
+      - ""
+      - "To reinstall, remove the installation directory:"
+      - "  rm -rf {{ ocp_install_dir }}"
+      - "Then re-run the prepare_openshift role."
+  when: kubeconfig_check.stat.exists
+
+- name: Stop if cluster already installed
+  meta: end_host
+  when: kubeconfig_check.stat.exists
+
+- name: Check if tmux session already exists
+  ansible.builtin.shell: tmux has-session -t {{ ocp_tmux_session }} 2>/dev/null
+  register: tmux_check
+  changed_when: false
+  failed_when: false
+
+- name: Display installation start message
+  debug:
+    msg:
+      - "=========================================="
+      - "Starting OpenShift Cluster Installation"
+      - "=========================================="
+      - ""
+      - "Installation directory: {{ ocp_install_dir }}"
+      - "Tmux session: {{ ocp_tmux_session }}"
+      - "Maximum wait time: {{ (ocp_install_timeout / 60) | int }} minutes"
+      - ""
+      - "The installer will:"
+      - "  1. Generate ignition configs"
+      - "  2. Boot master nodes via Redfish"
+      - "  3. Bootstrap the cluster"
+      - "  4. Complete installation"
+      - ""
+      - "This process typically takes 45-60 minutes."
+      - "=========================================="
+
+- name: Start OpenShift installation in tmux session
+  ansible.builtin.shell: |
+    tmux new-session -d -s {{ ocp_tmux_session }} \
+      "cd {{ ocp_install_dir }} && openshift-install create cluster --log-level=info"
+  when: tmux_check.rc != 0
+  become: true
+  become_user: ec2-user
+
+- name: Wait a moment for installation to start
+  ansible.builtin.pause:
+    seconds: 5
+
+- name: Monitor installation progress
+  block:
+    - name: Poll installation status
+      ansible.builtin.shell: |
+        # Check if tmux session is still running
+        if tmux has-session -t {{ ocp_tmux_session }} 2>/dev/null; then
+          echo "running"
+        else
+          echo "completed"
+        fi
+      register: install_status
+      until: install_status.stdout == "completed"
+      retries: "{{ (ocp_install_timeout / ocp_poll_interval) | int }}"
+      delay: "{{ ocp_poll_interval }}"
+      changed_when: false
+      become: true
+      become_user: ec2-user
+
+    - name: Get installation log tail during each check
+      ansible.builtin.shell: |
+        if [ -f {{ ocp_install_dir }}/.openshift_install.log ]; then
+          tail -n {{ ocp_log_tail_lines }} {{ ocp_install_dir }}/.openshift_install.log
+        else
+          echo "Log file not yet created..."
+        fi
+      register: install_log_tail
+      changed_when: false
+      when: install_status.stdout == "running"
+
+    - name: Display progress update
+      debug:
+        msg:
+          - "Installation in progress... (checked at {{ ansible_date_time.time }})"
+          - "Recent log entries:"
+          - "{{ install_log_tail.stdout_lines | default(['No log entries yet']) }}"
+      when: install_status.stdout == "running"
+
+  rescue:
+    - name: Installation timeout or error
+      debug:
+        msg:
+          - "=========================================="
+          - "Installation monitoring stopped"
+          - "=========================================="
+          - ""
+          - "The installation may still be running in tmux."
+          - "To check status manually:"
+          - "  ssh ec2-user@{{ ansible_host }}"
+          - "  tmux attach -t {{ ocp_tmux_session }}"
+          - ""
+          - "To view logs:"
+          - "  tail -f {{ ocp_install_dir }}/.openshift_install.log"
+
+    - name: Fail with timeout message
+      fail:
+        msg: "Installation monitoring timed out after {{ (ocp_install_timeout / 60) | int }} minutes"
+
+- name: Check if installation completed successfully
+  ansible.builtin.stat:
+    path: "{{ ocp_install_dir }}/auth/kubeconfig"
+  register: kubeconfig_final_check
+
+- name: Check for kubeadmin password file
+  ansible.builtin.stat:
+    path: "{{ ocp_install_dir }}/auth/kubeadmin-password"
+  register: kubeadmin_password_check
+
+- name: Fail if installation didn't produce expected files
+  fail:
+    msg: |
+      Installation completed but required files are missing!
+
+      Expected files:
+        - {{ ocp_install_dir }}/auth/kubeconfig
+        - {{ ocp_install_dir }}/auth/kubeadmin-password
+
+      Check the installation logs:
+        tail -100 {{ ocp_install_dir }}/.openshift_install.log
+  when: not kubeconfig_final_check.stat.exists or not kubeadmin_password_check.stat.exists
+
+- name: Read kubeadmin password
+  ansible.builtin.slurp:
+    src: "{{ ocp_install_dir }}/auth/kubeadmin-password"
+  register: kubeadmin_password_content
+
+- name: Set kubeadmin password fact
+  set_fact:
+    kubeadmin_password: "{{ kubeadmin_password_content.content | b64decode | trim }}"
+
+- name: Extract cluster info from kubeconfig
+  ansible.builtin.shell: |
+    grep 'server:' {{ ocp_install_dir }}/auth/kubeconfig | head -n1 | awk '{print $2}'
+  register: api_server_url
+  changed_when: false
+
+- name: Extract cluster name from kubeconfig
+  ansible.builtin.shell: |
+    grep 'cluster:' {{ ocp_install_dir }}/auth/kubeconfig | head -n1 | awk '{print $2}'
+  register: cluster_name_from_config
+  changed_when: false
+
+- name: Derive console URL from API server
+  set_fact:
+    console_url: "{{ api_server_url.stdout | regex_replace('api\\.', 'console-openshift-console.apps.') | regex_replace(':6443', '') }}"
+
+- name: Create .kube directory for root user
+  ansible.builtin.file:
+    path: /root/.kube
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: true
+
+- name: Create .kube directory for ec2-user
+  ansible.builtin.file:
+    path: /home/ec2-user/.kube
+    state: directory
+    owner: ec2-user
+    group: ec2-user
+    mode: '0755'
+
+- name: Copy kubeconfig to root user .kube directory
+  ansible.builtin.copy:
+    src: "{{ ocp_install_dir }}/auth/kubeconfig"
+    dest: /root/.kube/config
+    owner: root
+    group: root
+    mode: '0600'
+    remote_src: true
+  become: true
+
+- name: Copy kubeconfig to ec2-user .kube directory
+  ansible.builtin.copy:
+    src: "{{ ocp_install_dir }}/auth/kubeconfig"
+    dest: /home/ec2-user/.kube/config
+    owner: ec2-user
+    group: ec2-user
+    mode: '0600'
+    remote_src: true
+
+- name: Copy kubeadmin password to ec2-user home directory
+  ansible.builtin.copy:
+    src: "{{ ocp_install_dir }}/auth/kubeadmin-password"
+    dest: /home/ec2-user/kubeadmin-password
+    owner: ec2-user
+    group: ec2-user
+    mode: '0600'
+    remote_src: true
+
+- name: Verify oc command works for ec2-user
+  ansible.builtin.shell: oc whoami
+  register: oc_whoami
+  changed_when: false
+  failed_when: false
+  become: true
+  become_user: ec2-user
+
+- name: Get cluster version
+  ansible.builtin.shell: oc get clusterversion -o jsonpath='{.items[0].status.desired.version}'
+  register: cluster_version
+  changed_when: false
+  failed_when: false
+  become: true
+  become_user: ec2-user
+
+- name: Get cluster nodes
+  ansible.builtin.shell: oc get nodes --no-headers | wc -l
+  register: node_count
+  changed_when: false
+  failed_when: false
+  become: true
+  become_user: ec2-user
+
+- name: Read final installation log
+  ansible.builtin.shell: tail -50 {{ ocp_install_dir }}/.openshift_install.log
+  register: final_install_log
+  changed_when: false
+
+- name: Display installation success message
+  debug:
+    msg:
+      - "=========================================="
+      - "✓ OpenShift Cluster Installation Complete!"
+      - "=========================================="
+      - ""
+      - "Cluster Information:"
+      - "  Name: {{ cluster_name_from_config.stdout }}"
+      - "  Version: {{ cluster_version.stdout | default('checking...') }}"
+      - "  Nodes: {{ node_count.stdout | default('checking...') }}"
+      - ""
+      - "Access URLs:"
+      - "  API Server: {{ api_server_url.stdout }}"
+      - "  Web Console: {{ console_url }}"
+      - ""
+      - "Credentials:"
+      - "  Username: kubeadmin"
+      - "  Password: {{ kubeadmin_password }}"
+      - "  (Also saved to: /home/ec2-user/kubeadmin-password)"
+      - ""
+      - "Kubeconfig Location:"
+      - "  Root user: /root/.kube/config"
+      - "  EC2 user: /home/ec2-user/.kube/config"
+      - "  Original: {{ ocp_install_dir }}/auth/kubeconfig"
+      - ""
+      - "Command Line Access:"
+      - "  SSH to instance: ssh ec2-user@{{ ansible_host }}"
+      - "  Run oc commands: oc get nodes"
+      - "  Check cluster: oc get clusterversion"
+      - "  View all resources: oc get all -A"
+      - ""
+      - "Web Console Access:"
+      - "  1. Open browser to: {{ console_url }}"
+      - "  2. Login with username: kubeadmin"
+      - "  3. Login with password: {{ kubeadmin_password }}"
+      - ""
+      - "Installation logs:"
+      - "  {{ ocp_install_dir }}/.openshift_install.log"
+      - ""
+      - "=========================================="
+
+- name: Save cluster access information to file
+  ansible.builtin.copy:
+    content: |
+      OpenShift Cluster Access Information
+      =====================================
+      Installation completed: {{ ansible_date_time.iso8601 }}
+
+      Cluster Information:
+        Name: {{ cluster_name_from_config.stdout }}
+        Version: {{ cluster_version.stdout | default('N/A') }}
+        Nodes: {{ node_count.stdout | default('N/A') }}
+
+      Access URLs:
+        API Server: {{ api_server_url.stdout }}
+        Web Console: {{ console_url }}
+
+      Credentials:
+        Username: kubeadmin
+        Password: {{ kubeadmin_password }}
+
+      Kubeconfig Files:
+        Root: /root/.kube/config
+        EC2 User: /home/ec2-user/.kube/config
+        Original: {{ ocp_install_dir }}/auth/kubeconfig
+
+      Quick Commands:
+        oc get nodes
+        oc get clusterversion
+        oc get co  # Cluster operators
+        oc get pods -A  # All pods
+
+      Web Console:
+        URL: {{ console_url }}
+        Username: kubeadmin
+        Password: {{ kubeadmin_password }}
+
+      Documentation:
+        Installation logs: {{ ocp_install_dir }}/.openshift_install.log
+        Network config: {{ ocp_install_dir }}/network-config.txt (if exists)
+    dest: /home/ec2-user/openshift-cluster-access.txt
+    owner: ec2-user
+    group: ec2-user
+    mode: '0600'
+
+- name: Display final log entries
+  debug:
+    msg:
+      - "=========================================="
+      - "Final Installation Log Entries:"
+      - "=========================================="
+      - "{{ final_install_log.stdout_lines }}"

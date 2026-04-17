@@ -1,0 +1,89 @@
+# Python virtual environment
+venv/
+env/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Ansible
+*.retry
+.ansible/
+/tmp/ansible_facts
+inventory
+hosts
+
+# AWS
+.aws/
+
+# SSH keys (don't commit!)
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Terraform (if used later)
+.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+
+# Backup files
+*.backup
+*.bak
+
+# OpenShift install files (contain secrets)
+install-config.yaml.backup
+auth/
+metadata.json
+*.ign
+pullsecret.json
+kubeconfig
+kubeadmin-password
+
+# Sensitive data patterns
+*secret*
+*credential*
+*token*
+!pullsecret.json.example
+!*secret*.example
+!*secret*.md
+!roles/**/tasks/*secret*.yml
+
+# SSH keys and certificates
+id_rsa*
+*.pub
+!*.pub.example
+*.crt
+*.csr
+
+# AWS credentials
+.aws/
+credentials
+config
+
+# Temporary/log files
+*.log
+/tmp/
+*.output
+.tasks/
+
+# Large binary files
+*.iso
+*.qcow2
+*.img
+*.pkg
+AWSCLIV2.pkg

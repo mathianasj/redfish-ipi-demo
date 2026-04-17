@@ -1,0 +1,90 @@
+---
+- name: Modify EC2 instance type
+  hosts: localhost
+  gather_facts: false
+  vars:
+    aws_region: us-east-2
+    instance_name: nested-virt-host
+    new_instance_type: ""  # Must be provided as --extra-vars "new_instance_type=m7i.16xlarge"
+
+  tasks:
+    - name: Fail if new instance type not provided
+      fail:
+        msg: |
+          New instance type must be provided!
+          Usage: ansible-playbook modify-instance-type.yml --extra-vars "new_instance_type=m7i.16xlarge"
+      when: new_instance_type == ""
+
+    - name: Find EC2 instance by name tag
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+      register: instance_info
+
+    - name: Fail if instance not found
+      fail:
+        msg: "No instance found with Name tag: {{ instance_name }}"
+      when: instance_info.instances | length == 0
+
+    - name: Set instance facts
+      set_fact:
+        instance_id: "{{ instance_info.instances[0].instance_id }}"
+        current_instance_type: "{{ instance_info.instances[0].instance_type }}"
+        instance_state: "{{ instance_info.instances[0].state.name }}"
+
+    - name: Display current configuration
+      debug:
+        msg:
+          - "Instance ID: {{ instance_id }}"
+          - "Current Type: {{ current_instance_type }}"
+          - "New Type: {{ new_instance_type }}"
+          - "Current State: {{ instance_state }}"
+
+    - name: Fail if instance is not stopped
+      fail:
+        msg: |
+          Instance must be stopped before modifying instance type!
+          Current state: {{ instance_state }}
+
+          Run: ansible-playbook stop-instance.yml
+      when: instance_state != "stopped"
+
+    - name: Check if new type is the same as current
+      debug:
+        msg: "Instance is already {{ current_instance_type }}, no change needed"
+      when: current_instance_type == new_instance_type
+
+    - name: Modify instance type
+      shell: |
+        aws ec2 modify-instance-attribute \
+          --region {{ aws_region }} \
+          --instance-id {{ instance_id }} \
+          --instance-type {{ new_instance_type }}
+      register: modify_result
+      when: current_instance_type != new_instance_type
+
+    - name: Wait a moment for modification to apply
+      pause:
+        seconds: 3
+      when: current_instance_type != new_instance_type
+
+    - name: Verify new instance type
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        instance_ids:
+          - "{{ instance_id }}"
+      register: updated_info
+
+    - name: Display modification results
+      debug:
+        msg:
+          - "=========================================="
+          - "Instance Type Modified"
+          - "=========================================="
+          - "Instance ID: {{ instance_id }}"
+          - "Previous Type: {{ current_instance_type }}"
+          - "New Type: {{ updated_info.instances[0].instance_type }}"
+          - "State: {{ updated_info.instances[0].state.name }}"
+          - ""
+          - "Next step: ansible-playbook start-instance.yml"

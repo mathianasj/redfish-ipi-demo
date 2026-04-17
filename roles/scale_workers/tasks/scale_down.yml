@@ -1,0 +1,144 @@
+---
+# Scale down tasks - removes a single worker
+- name: Display worker being removed
+  debug:
+    msg:
+      - "Removing worker: {{ worker_to_remove.name }}"
+      - "  UUID: {{ worker_to_remove.uuid }}"
+      - "  MAC: {{ worker_to_remove.mac }}"
+
+- name: Check if BareMetalHost exists
+  ansible.builtin.shell: |
+    oc get baremetalhost {{ worker_to_remove.name }} -n openshift-machine-api -o name 2>/dev/null || echo ""
+  register: bmh_exists_check
+  changed_when: false
+  become: true
+  become_user: ec2-user
+
+- name: Get current BareMetalHost state
+  ansible.builtin.shell: |
+    oc get baremetalhost {{ worker_to_remove.name }} -n openshift-machine-api -o jsonpath='{.status.provisioning.state}'
+  register: current_bmh_state
+  changed_when: false
+  become: true
+  become_user: ec2-user
+  when: bmh_exists_check.stdout != ""
+
+- name: Display current BareMetalHost state
+  debug:
+    msg: "Current BareMetalHost state: {{ current_bmh_state.stdout }}"
+  when: bmh_exists_check.stdout != ""
+
+- name: Deprovision BareMetalHost (set to available)
+  ansible.builtin.shell: |
+    oc patch baremetalhost {{ worker_to_remove.name }} -n openshift-machine-api \
+      --type merge \
+      -p '{"spec":{"online":false}}'
+  register: deprovision_result
+  become: true
+  become_user: ec2-user
+  when:
+    - bmh_exists_check.stdout != ""
+    - current_bmh_state.stdout in ['provisioned', 'provisioning']
+
+- name: Wait for BareMetalHost to be deprovisioned
+  ansible.builtin.shell: |
+    oc get baremetalhost {{ worker_to_remove.name }} -n openshift-machine-api -o jsonpath='{.status.provisioning.state}'
+  register: deprovision_state
+  until: deprovision_state.stdout in ['available', 'ready', 'deprovisioning']
+  retries: "{{ (deprovision_timeout / deprovision_poll_interval) | int }}"
+  delay: "{{ deprovision_poll_interval }}"
+  changed_when: false
+  become: true
+  become_user: ec2-user
+  when:
+    - bmh_exists_check.stdout != ""
+    - deprovision_result is changed
+
+- name: Display deprovisioning progress
+  debug:
+    msg:
+      - "Deprovisioning status for {{ worker_to_remove.name }}:"
+      - "  Current state: {{ deprovision_state.stdout }}"
+      - "  {{ 'Deprovisioning complete!' if deprovision_state.stdout in ['available', 'ready'] else 'Still deprovisioning...' }}"
+  when:
+    - bmh_exists_check.stdout != ""
+    - deprovision_result is changed
+
+- name: Ensure BareMetalHost is fully deprovisioned before removal
+  ansible.builtin.shell: |
+    oc get baremetalhost {{ worker_to_remove.name }} -n openshift-machine-api -o jsonpath='{.status.provisioning.state}'
+  register: final_state_check
+  changed_when: false
+  become: true
+  become_user: ec2-user
+  when: bmh_exists_check.stdout != ""
+
+- name: Warn if BareMetalHost is not in safe state for removal
+  debug:
+    msg:
+      - "WARNING: BareMetalHost {{ worker_to_remove.name }} is in state '{{ final_state_check.stdout }}'"
+      - "Recommended states for removal: available, ready"
+      - "Proceeding anyway as requested..."
+  when:
+    - bmh_exists_check.stdout != ""
+    - final_state_check.stdout not in ['available', 'ready', '']
+
+- name: Delete BareMetalHost resource from cluster
+  ansible.builtin.shell: |
+    oc delete baremetalhost {{ worker_to_remove.name }} -n openshift-machine-api --wait=true
+  register: bmh_delete_result
+  become: true
+  become_user: ec2-user
+  when: bmh_exists_check.stdout != ""
+
+- name: Display BareMetalHost deletion result
+  debug:
+    msg: "BareMetalHost {{ worker_to_remove.name }} deleted from cluster"
+  when: bmh_delete_result is changed
+
+- name: Check if worker VM exists
+  ansible.builtin.shell: |
+    virsh list --all --name | grep -w {{ worker_to_remove.name }} || echo ""
+  register: vm_exists_check
+  changed_when: false
+  become: true
+
+- name: Destroy worker VM if running
+  ansible.builtin.shell: virsh destroy {{ worker_to_remove.name }}
+  when: vm_exists_check.stdout != ""
+  become: true
+  failed_when: false
+  register: vm_destroy_result
+
+- name: Undefine worker VM
+  ansible.builtin.shell: virsh undefine {{ worker_to_remove.name }} --nvram
+  when: vm_exists_check.stdout != ""
+  become: true
+  register: vm_undefine_result
+
+- name: Display VM removal result
+  debug:
+    msg: "VM {{ worker_to_remove.name }} removed from libvirt"
+  when: vm_undefine_result is changed
+
+- name: Remove worker disk image
+  ansible.builtin.shell: |
+    DISK_PATH=$(virsh vol-list default | grep {{ worker_to_remove.name }} | awk '{print $2}')
+    if [ ! -z "$DISK_PATH" ]; then
+      virsh vol-delete --pool default "$DISK_PATH"
+    fi
+  become: true
+  failed_when: false
+  when: vm_exists_check.stdout != ""
+
+- name: Remove worker from state tracking
+  set_fact:
+    current_workers: "{{ current_workers | reject('equalto', worker_to_remove) | list }}"
+
+- name: Display worker removal success
+  debug:
+    msg:
+      - "✓ Worker {{ worker_to_remove.name }} removed successfully"
+      - "  BareMetalHost: Deleted from cluster"
+      - "  VM: Removed from libvirt"

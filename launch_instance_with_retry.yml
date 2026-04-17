@@ -1,0 +1,75 @@
+---
+# Attempt to launch instance in a specific subnet/AZ
+# subnet_attempt structure: result from ec2_vpc_subnet with .subnet details
+
+- name: Display launch attempt
+  debug:
+    msg: "Attempting to launch {{ instance_type }} in {{ subnet_attempt.subnet.availability_zone }} ({{ subnet_attempt.subnet.cidr_block }})..."
+
+- name: Attempt to launch EC2 instance
+  shell: |
+    aws ec2 run-instances \
+      --region {{ aws_region }} \
+      --image-id {{ ami_id }} \
+      --instance-type {{ instance_type }} \
+      --key-name {{ key_name }} \
+      --subnet-id {{ subnet_attempt.subnet.id }} \
+      --security-group-ids {{ security_group.group_id }} \
+      --associate-public-ip-address \
+      --cpu-options CoreCount={{ cpu_core_count }},ThreadsPerCore={{ cpu_threads_per_core }},NestedVirtualization=enabled \
+      --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":{{ root_volume_size | default(500) }},"VolumeType":"gp3","Iops":3000,"Throughput":125,"DeleteOnTermination":true}}]' \
+      --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value={{ instance_name }}},{Key=Purpose,Value=nested-virtualization}]' \
+      --query 'Instances[0].InstanceId' \
+      --output text
+  register: launch_result
+  failed_when: false
+  changed_when: false
+
+- name: Check for InsufficientInstanceCapacity
+  set_fact:
+    capacity_error: "{{ 'InsufficientInstanceCapacity' in launch_result.stderr }}"
+
+- name: Handle successful launch
+  block:
+    - name: Mark launch as successful
+      set_fact:
+        launch_successful: true
+        launch_subnet: "{{ subnet_attempt.subnet.id }}"
+        launch_az: "{{ subnet_attempt.subnet.availability_zone }}"
+        instance_id: "{{ launch_result.stdout }}"
+
+    - name: Display success
+      debug:
+        msg:
+          - "✓ SUCCESS! Instance launched in {{ subnet_attempt.subnet.availability_zone }}"
+          - "  Instance ID: {{ instance_id }}"
+          - "  Subnet: {{ subnet_attempt.subnet.id }}"
+          - "  CIDR: {{ subnet_attempt.subnet.cidr_block }}"
+
+    - name: Wait for instance to be running
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        instance_ids:
+          - "{{ instance_id }}"
+      register: instance_wait
+      retries: 60
+      delay: 5
+      until:
+        - instance_wait.instances | length > 0
+        - instance_wait.instances[0].state.name == 'running'
+
+    - name: Set ec2 variable for compatibility
+      set_fact:
+        ec2:
+          instance_ids:
+            - "{{ instance_id }}"
+
+  when: launch_result.rc == 0 and not capacity_error
+
+- name: Handle launch failure
+  block:
+    - name: Display capacity failure
+      debug:
+        msg: "✗ FAILED: {{ subnet_attempt.subnet.availability_zone }} - InsufficientInstanceCapacity, trying next AZ..."
+
+  when: capacity_error or launch_result.rc != 0

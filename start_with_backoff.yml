@@ -1,0 +1,75 @@
+---
+# Single retry attempt with state verification
+
+- name: Wait before retry (skip on first attempt)
+  pause:
+    seconds: "{{ current_delay | int }}"
+  when: retry_attempt > 0
+
+- name: Display retry attempt
+  debug:
+    msg:
+      - "Attempt {{ retry_attempt + 1 }} of {{ max_retries }}"
+      - "{{ 'Initial attempt' if retry_attempt == 0 else 'Retry after ' ~ current_delay ~ ' seconds' }}"
+
+- name: Send start command to instance
+  amazon.aws.ec2_instance:
+    instance_ids:
+      - "{{ instance_id }}"
+    region: "{{ aws_region }}"
+    state: started
+    wait: false
+  register: start_command
+  ignore_errors: true
+
+- name: Wait a moment for state change to begin
+  pause:
+    seconds: 3
+
+- name: Check if instance actually started
+  amazon.aws.ec2_instance_info:
+    region: "{{ aws_region }}"
+    instance_ids:
+      - "{{ instance_id }}"
+  register: instance_check
+
+- name: Determine if start was successful
+  set_fact:
+    instance_current_state: "{{ instance_check.instances[0].state.name }}"
+    start_successful: "{{ instance_check.instances[0].state.name in ['running', 'pending'] }}"
+
+- name: Display result of this attempt
+  debug:
+    msg:
+      - "Attempt {{ retry_attempt + 1 }} result: {{ 'SUCCESS' if start_successful | bool else 'FAILED' }}"
+      - "Instance state: {{ instance_current_state }}"
+
+- name: Store last error if failed
+  set_fact:
+    last_error: "Instance remained in {{ instance_current_state }} state - likely InsufficientInstanceCapacity"
+  when: not (start_successful | bool)
+
+- name: Calculate next delay with exponential backoff
+  set_fact:
+    current_delay: "{{ [current_delay | float * backoff_multiplier, max_delay] | min | int }}"
+  when: not (start_successful | bool)
+
+- name: Show next retry delay
+  debug:
+    msg: "Instance did not start. Next retry in {{ current_delay }} seconds..."
+  when:
+    - not (start_successful | bool)
+    - retry_attempt < (max_retries - 1)
+
+- name: Wait for instance to reach running state
+  amazon.aws.ec2_instance_info:
+    region: "{{ aws_region }}"
+    instance_ids:
+      - "{{ instance_id }}"
+  register: running_wait
+  until:
+    - running_wait.instances | length > 0
+    - running_wait.instances[0].state.name == "running"
+  retries: 30
+  delay: 5
+  when: start_successful | bool

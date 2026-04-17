@@ -1,0 +1,9 @@
+ansible>=2.15.0
+boto3>=1.26.0
+botocore>=1.29.0
+passlib>=1.7.4
+
+# Optional: For Redfish client testing
+# sushy-tools is installed on the EC2 instance, not locally
+# Uncomment below if you want to test Redfish API from your local machine
+# redfish>=3.0.0

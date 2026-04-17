@@ -1,0 +1,1551 @@
+---
+# Complete OpenShift Baremetal on EC2 Deployment
+# This playbook performs a full end-to-end deployment:
+#   1. AWS Infrastructure - Create EC2 instance with nested virtualization
+#   2. Configure Virtualization - Setup KVM, libvirt, networking
+#   3. DNS Configuration - Setup BIND DNS for OpenShift domains
+#   4. Prepare OpenShift - Create VMs and install-config.yaml
+#   5. Install OpenShift - Run openshift-install and configure access
+#
+# Total estimated time: 60-90 minutes
+#   - AWS setup: 5-10 minutes
+#   - Virtualization setup: 10-15 minutes
+#   - DNS configuration: 2-3 minutes
+#   - OpenShift preparation: 5-10 minutes
+#   - OpenShift installation: 45-60 minutes
+
+- name: Create EC2 instance with nested virtualization support
+  hosts: localhost
+  gather_facts: false
+  become: false  # Don't use sudo for localhost tasks
+  vars:
+    aws_region: us-east-2
+    instance_type: m8i.16xlarge  # Supports nested virtualization without bare metal
+    ami_id: ami-0cd1c27314f28c1ce  # RHEL 9 (verify with: aws ec2 describe-images --region us-east-2 --owners 309956199498)
+    key_name: nested-virt-key  # EC2 key pair name to create
+    ssh_public_key_path: "~/.ssh/id_rsa_fips.pub"  # Path to your SSH public key
+    ssh_private_key_path: "~/.ssh/id_rsa_fips"  # Path to your SSH private key
+    instance_name: nested-virt-host
+    vpc_cidr: 10.0.0.0/16
+    subnet_cidrs:
+      - 10.0.1.0/24
+      - 10.0.2.0/24
+      - 10.0.3.0/24
+    # CPU options for m8i.16xlarge (32 cores, 64 vCPUs with hyperthreading)
+    cpu_core_count: 32
+    cpu_threads_per_core: 2
+
+  pre_tasks:
+    - name: Display deployment workflow
+      debug:
+        msg:
+          - "=========================================="
+          - "OpenShift Baremetal on EC2 - Complete Deployment"
+          - "=========================================="
+          - ""
+          - "This playbook will execute the following phases:"
+          - ""
+          - "Phase 1: AWS Infrastructure (5-10 min)"
+          - "  ✓ Create VPC and networking"
+          - "  ✓ Launch EC2 instance ({{ instance_type }})"
+          - "  ✓ Configure security groups"
+          - ""
+          - "Phase 2: Virtualization Setup (10-15 min)"
+          - "  ✓ Install KVM and libvirt"
+          - "  ✓ Configure networking bridges"
+          - "  ✓ Setup Redfish BMC (sushy-tools)"
+          - "  ✓ Install OpenShift CLI tools"
+          - ""
+          - "Phase 3: DNS Configuration (2-3 min)"
+          - "  ✓ Install and configure BIND DNS"
+          - "  ✓ Create OpenShift DNS records"
+          - ""
+          - "Phase 4: OpenShift Preparation (5-10 min)"
+          - "  ✓ Create master VMs (3 nodes)"
+          - "  ✓ Generate install-config.yaml"
+          - "  ✓ Configure network settings"
+          - ""
+          - "Phase 5: OpenShift Installation (45-60 min)"
+          - "  ✓ Run openshift-install in tmux"
+          - "  ✓ Monitor progress"
+          - "  ✓ Configure kubeconfig access"
+          - "  ✓ Save credentials and URLs"
+          - ""
+          - "Total estimated time: 60-90 minutes"
+          - ""
+          - "You can safely disconnect during Phase 5."
+          - "The installation will continue in tmux."
+          - "=========================================="
+
+  tasks:
+    - name: Read SSH public key
+      ansible.builtin.slurp:
+        src: "{{ ssh_public_key_path }}"
+      register: ssh_public_key_content
+
+    - name: Create or update EC2 key pair from SSH public key
+      amazon.aws.ec2_key:
+        name: "{{ key_name }}"
+        key_material: "{{ ssh_public_key_content.content | b64decode }}"
+        region: "{{ aws_region }}"
+        tags:
+          Name: "{{ key_name }}"
+          CreatedBy: ansible
+      register: ec2_key
+    - name: Create VPC
+      amazon.aws.ec2_vpc_net:
+        name: "{{ instance_name }}-vpc"
+        cidr_block: "{{ vpc_cidr }}"
+        region: "{{ aws_region }}"
+        tags:
+          Name: "{{ instance_name }}-vpc"
+      register: vpc
+
+    - name: Create Internet Gateway
+      amazon.aws.ec2_vpc_igw:
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ aws_region }}"
+        tags:
+          Name: "{{ instance_name }}-igw"
+      register: igw
+
+    - name: Get availability zones in the region
+      shell: |
+        aws ec2 describe-availability-zones \
+          --region {{ aws_region }} \
+          --filters Name=state,Values=available \
+          --query 'AvailabilityZones[0:3].ZoneName' \
+          --output text
+      register: availability_zones_result
+      changed_when: false
+
+    - name: Parse availability zones
+      set_fact:
+        availability_zones: "{{ availability_zones_result.stdout.split() }}"
+
+    - name: Display availability zones
+      debug:
+        msg: "Creating subnets in {{ availability_zones | length }} availability zones: {{ availability_zones | join(', ') }}"
+
+    - name: Create subnets in each availability zone
+      amazon.aws.ec2_vpc_subnet:
+        vpc_id: "{{ vpc.vpc.id }}"
+        cidr: "{{ item.0 }}"
+        az: "{{ item.1 }}"
+        region: "{{ aws_region }}"
+        map_public: true
+        tags:
+          Name: "{{ instance_name }}-subnet-{{ item.1 }}"
+          AZ: "{{ item.1 }}"
+      loop: "{{ subnet_cidrs | zip(availability_zones) | list }}"
+      register: subnets_result
+
+    - name: Extract subnet IDs
+      set_fact:
+        subnet_ids: "{{ subnets_result.results | map(attribute='subnet.id') | list }}"
+        primary_subnet_id: "{{ subnets_result.results[0].subnet.id }}"
+
+    - name: Display created subnets summary
+      debug:
+        msg: "Created {{ subnets_result.results | length }} subnets - primary subnet: {{ primary_subnet_id }}"
+
+    - name: Display subnet details
+      debug:
+        msg: "  {{ item.subnet.availability_zone }}: {{ item.subnet.cidr_block }} ({{ item.subnet.id }})"
+      loop: "{{ subnets_result.results }}"
+      loop_control:
+        label: "{{ item.subnet.availability_zone }}"
+
+    - name: Create route table
+      amazon.aws.ec2_vpc_route_table:
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ aws_region }}"
+        tags:
+          Name: "{{ instance_name }}-rt"
+        subnets: "{{ subnet_ids }}"
+        routes:
+          - dest: 0.0.0.0/0
+            gateway_id: "{{ igw.gateway_id }}"
+      register: route_table
+
+    - name: Create security group
+      amazon.aws.ec2_security_group:
+        name: "{{ instance_name }}-sg"
+        description: Security group for nested virtualization host
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ aws_region }}"
+        rules:
+          - proto: tcp
+            ports:
+              - 22
+            cidr_ip: 0.0.0.0/0
+            rule_desc: SSH access
+          - proto: tcp
+            ports:
+              - 9090
+            cidr_ip: 0.0.0.0/0
+            rule_desc: Cockpit web console
+          - proto: tcp
+            ports:
+              - 8000
+            cidr_ip: 0.0.0.0/0
+            rule_desc: Sushy Redfish emulator
+          - proto: tcp
+            ports:
+              - 5900-5910
+            cidr_ip: 0.0.0.0/0
+            rule_desc: VNC access for VMs
+          - proto: icmp
+            from_port: -1
+            to_port: -1
+            cidr_ip: 0.0.0.0/0
+            rule_desc: ICMP
+        tags:
+          Name: "{{ instance_name }}-sg"
+      register: security_group
+
+    - name: Check for existing instance
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+          "instance-state-name": ["running", "stopped", "stopping", "pending"]
+      register: existing_instances
+
+    - name: Initialize launch tracking
+      set_fact:
+        launch_successful: false
+        launch_subnet: ""
+        launch_az: ""
+      when: existing_instances.instances | length == 0
+
+    - name: Attempt to launch instance in each AZ until successful
+      include_tasks: launch_instance_with_retry.yml
+      loop: "{{ subnets_result.results }}"
+      loop_control:
+        loop_var: subnet_attempt
+      when:
+        - existing_instances.instances | length == 0
+        - not launch_successful
+
+    - name: Fail if instance could not be launched in any AZ
+      fail:
+        msg: "Failed to launch instance in any availability zone. InsufficientInstanceCapacity in all {{ subnets_result.results | length }} AZs."
+      when:
+        - existing_instances.instances | length == 0
+        - not launch_successful
+
+    - name: Use existing instance
+      set_fact:
+        instance_id: "{{ existing_instances.instances[0].instance_id }}"
+      when: existing_instances.instances | length > 0
+
+    - name: Wait a moment for instance to be fully ready
+      ansible.builtin.pause:
+        seconds: 5
+      when: existing_instances.instances | length > 0
+
+    - name: Get instance details
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        instance_ids:
+          - "{{ instance_id }}"
+      register: ec2_info
+      retries: 10
+      delay: 5
+      until:
+        - ec2_info.instances | length > 0
+        - ec2_info.instances[0].state.name == 'running'
+        - ec2_info.instances[0].public_ip_address is defined
+        - ec2_info.instances[0].public_ip_address != ''
+
+    - name: Set instance facts
+      set_fact:
+        instance_public_ip: "{{ ec2_info.instances[0].public_ip_address }}"
+
+    - name: Verify instance CPU options for nested virtualization
+      shell: |
+        aws ec2 describe-instances \
+          --region {{ aws_region }} \
+          --instance-ids {{ instance_id }} \
+          --query 'Reservations[0].Instances[0].CpuOptions' \
+          --output json
+      register: cpu_options_check
+      changed_when: false
+
+    - name: Verify instance type supports nested virtualization
+      shell: |
+        aws ec2 describe-instance-types \
+          --region {{ aws_region }} \
+          --instance-types {{ instance_type }} \
+          --query 'InstanceTypes[0].ProcessorInfo.SupportedFeatures' \
+          --output json
+      register: supported_features_check
+      changed_when: false
+
+    - name: Display CPU configuration verification
+      debug:
+        msg:
+          - "CPU Options Applied: {{ cpu_options_check.stdout | from_json }}"
+          - "Supported Features: {{ supported_features_check.stdout | from_json }}"
+          - "Nested Virtualization CPU Option: {{ (cpu_options_check.stdout | from_json).NestedVirtualization | default('not set') }}"
+          - "Instance Type Supports Nested Virt: {{ 'YES' if 'nested-virtualization' in (supported_features_check.stdout | from_json | default([])) else 'NO' }}"
+
+    - name: Check if NestedVirtualization CPU option needs to be set
+      set_fact:
+        nested_virt_not_set: "{{ (cpu_options_check.stdout | from_json).NestedVirtualization is not defined or (cpu_options_check.stdout | from_json).NestedVirtualization != 'enabled' }}"
+
+    - name: Fix NestedVirtualization CPU option if not set
+      block:
+        - name: Display fixing message
+          debug:
+            msg: "NestedVirtualization CPU option not set - fixing now..."
+
+        - name: Stop instance to modify CPU options
+          amazon.aws.ec2_instance:
+            instance_ids:
+              - "{{ instance_id }}"
+            state: stopped
+            region: "{{ aws_region }}"
+            wait: true
+            wait_timeout: 300
+
+        - name: Set NestedVirtualization CPU option
+          shell: |
+            aws ec2 modify-instance-attribute \
+              --region {{ aws_region }} \
+              --instance-id {{ instance_id }} \
+              --cpu-options "NestedVirtualization=enabled"
+          changed_when: true
+
+        - name: Verify CPU options were set before starting
+          shell: |
+            aws ec2 describe-instances \
+              --region {{ aws_region }} \
+              --instance-ids {{ instance_id }} \
+              --query 'Reservations[0].Instances[0].CpuOptions' \
+              --output json
+          register: cpu_options_precheck
+          changed_when: false
+
+        - name: Display CPU options before starting
+          debug:
+            msg:
+              - "CPU Options (before start): {{ cpu_options_precheck.stdout | from_json }}"
+              - "NestedVirtualization: {{ (cpu_options_precheck.stdout | from_json).NestedVirtualization | default('NOT SET') }}"
+
+        - name: Fail if CPU options not set correctly
+          fail:
+            msg: "NestedVirtualization CPU option failed to set. Instance type may not support modification."
+          when: (cpu_options_precheck.stdout | from_json).NestedVirtualization is not defined or (cpu_options_precheck.stdout | from_json).NestedVirtualization != 'enabled'
+
+        - name: Start instance with updated CPU options
+          amazon.aws.ec2_instance:
+            instance_ids:
+              - "{{ instance_id }}"
+            state: started
+            region: "{{ aws_region }}"
+            wait: true
+            wait_timeout: 300
+
+        - name: Wait for instance to be running
+          amazon.aws.ec2_instance_info:
+            region: "{{ aws_region }}"
+            instance_ids:
+              - "{{ instance_id }}"
+          register: restarted_instance
+          retries: 30
+          delay: 5
+          until: restarted_instance.instances[0].state.name == 'running'
+
+        - name: Re-verify CPU options after instance is running
+          shell: |
+            aws ec2 describe-instances \
+              --region {{ aws_region }} \
+              --instance-ids {{ instance_id }} \
+              --query 'Reservations[0].Instances[0].CpuOptions' \
+              --output json
+          register: cpu_options_recheck
+          changed_when: false
+
+        - name: Display final CPU options
+          debug:
+            msg:
+              - "Final CPU Options: {{ cpu_options_recheck.stdout | from_json }}"
+              - "Nested Virtualization: {{ (cpu_options_recheck.stdout | from_json).NestedVirtualization | default('FAILED') }}"
+
+      when: nested_virt_not_set | bool
+
+    - name: Add new instance to host group
+      add_host:
+        hostname: "{{ instance_public_ip }}"
+        groupname: nested_virt_hosts
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: "{{ ssh_private_key_path }}"
+
+    - name: Get instance availability zone
+      set_fact:
+        instance_az: "{{ ec2_info.instances[0].placement.availability_zone }}"
+
+    - name: Check for existing storage volume
+      amazon.aws.ec2_vol_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}-storage"
+      register: existing_volume
+
+    - name: Check if existing volume is in different AZ
+      set_fact:
+        volume_in_wrong_az: "{{ existing_volume.volumes | length > 0 and existing_volume.volumes[0].zone != instance_az }}"
+
+    - name: Handle volume in different AZ
+      block:
+        - name: Display AZ mismatch warning
+          debug:
+            msg:
+              - "WARNING: Existing storage volume is in {{ existing_volume.volumes[0].zone }}"
+              - "Instance is in {{ instance_az }}"
+              - "Creating snapshot and migrating volume to correct AZ..."
+
+        - name: Create snapshot of existing volume
+          amazon.aws.ec2_snapshot:
+            region: "{{ aws_region }}"
+            volume_id: "{{ existing_volume.volumes[0].id }}"
+            description: "Migration snapshot for {{ instance_name }}-storage to {{ instance_az }}"
+            snapshot_tags:
+              Name: "{{ instance_name }}-storage-migration"
+          register: storage_snapshot
+
+        - name: Wait for snapshot to complete
+          amazon.aws.ec2_snapshot_info:
+            region: "{{ aws_region }}"
+            snapshot_ids:
+              - "{{ storage_snapshot.snapshot_id }}"
+          register: snapshot_status
+          retries: 60
+          delay: 10
+          until: snapshot_status.snapshots[0].state == 'completed'
+
+        - name: Create new volume from snapshot in correct AZ
+          amazon.aws.ec2_vol:
+            region: "{{ aws_region }}"
+            zone: "{{ instance_az }}"
+            snapshot: "{{ storage_snapshot.snapshot_id }}"
+            volume_type: gp3
+            iops: 3000
+            throughput: 125
+            tags:
+              Name: "{{ instance_name }}-storage"
+              Purpose: vm-storage
+              MigratedFrom: "{{ existing_volume.volumes[0].zone }}"
+          register: migrated_storage_volume
+
+        - name: Delete old volume in wrong AZ
+          amazon.aws.ec2_vol:
+            region: "{{ aws_region }}"
+            id: "{{ existing_volume.volumes[0].id }}"
+            state: absent
+
+        - name: Set migrated storage volume ID
+          set_fact:
+            storage_volume_id: "{{ migrated_storage_volume.volume_id }}"
+
+      when: volume_in_wrong_az
+
+    - name: Create EBS volume for storage (no existing volume)
+      amazon.aws.ec2_vol:
+        region: "{{ aws_region }}"
+        zone: "{{ instance_az }}"
+        volume_size: "{{ storage_volume_size | default(1024) }}"
+        volume_type: gp3
+        iops: 3000
+        throughput: 125
+        tags:
+          Name: "{{ instance_name }}-storage"
+          Purpose: vm-storage
+        state: present
+      register: storage_volume
+      when: existing_volume.volumes | length == 0
+
+    - name: Use existing storage volume (same AZ)
+      set_fact:
+        storage_volume_id: "{{ existing_volume.volumes[0].id }}"
+      when:
+        - existing_volume.volumes | length > 0
+        - not volume_in_wrong_az
+
+    - name: Use newly created storage volume
+      set_fact:
+        storage_volume_id: "{{ storage_volume.volume_id }}"
+      when: existing_volume.volumes | length == 0
+
+    - name: Attach storage volume to instance
+      amazon.aws.ec2_vol:
+        region: "{{ aws_region }}"
+        instance: "{{ instance_id }}"
+        id: "{{ storage_volume_id }}"
+        device_name: /dev/sdf
+        delete_on_termination: false
+        state: present
+
+    - name: Check for existing OpenShift images volume
+      amazon.aws.ec2_vol_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}-openshift-images"
+      register: existing_ocp_volume
+
+    - name: Check if existing OCP volume is in different AZ
+      set_fact:
+        ocp_volume_in_wrong_az: "{{ existing_ocp_volume.volumes | length > 0 and existing_ocp_volume.volumes[0].zone != instance_az }}"
+
+    - name: Handle OCP volume in different AZ
+      block:
+        - name: Display OCP volume AZ mismatch warning
+          debug:
+            msg:
+              - "WARNING: Existing OpenShift images volume is in {{ existing_ocp_volume.volumes[0].zone }}"
+              - "Instance is in {{ instance_az }}"
+              - "Creating snapshot and migrating volume to correct AZ..."
+
+        - name: Create snapshot of existing OCP volume
+          amazon.aws.ec2_snapshot:
+            region: "{{ aws_region }}"
+            volume_id: "{{ existing_ocp_volume.volumes[0].id }}"
+            description: "Migration snapshot for {{ instance_name }}-openshift-images to {{ instance_az }}"
+            snapshot_tags:
+              Name: "{{ instance_name }}-openshift-images-migration"
+          register: ocp_snapshot
+
+        - name: Wait for OCP snapshot to complete
+          amazon.aws.ec2_snapshot_info:
+            region: "{{ aws_region }}"
+            snapshot_ids:
+              - "{{ ocp_snapshot.snapshot_id }}"
+          register: ocp_snapshot_status
+          retries: 60
+          delay: 10
+          until: ocp_snapshot_status.snapshots[0].state == 'completed'
+
+        - name: Create new OCP volume from snapshot in correct AZ
+          amazon.aws.ec2_vol:
+            region: "{{ aws_region }}"
+            zone: "{{ instance_az }}"
+            snapshot: "{{ ocp_snapshot.snapshot_id }}"
+            volume_type: gp3
+            iops: 3000
+            throughput: 125
+            tags:
+              Name: "{{ instance_name }}-openshift-images"
+              Purpose: openshift-vm-images
+              MigratedFrom: "{{ existing_ocp_volume.volumes[0].zone }}"
+          register: migrated_ocp_volume
+
+        - name: Delete old OCP volume in wrong AZ
+          amazon.aws.ec2_vol:
+            region: "{{ aws_region }}"
+            id: "{{ existing_ocp_volume.volumes[0].id }}"
+            state: absent
+
+        - name: Set migrated OCP volume ID
+          set_fact:
+            ocp_volume_id: "{{ migrated_ocp_volume.volume_id }}"
+
+      when: ocp_volume_in_wrong_az
+
+    - name: Create EBS volume for OpenShift images (no existing volume)
+      amazon.aws.ec2_vol:
+        region: "{{ aws_region }}"
+        zone: "{{ instance_az }}"
+        volume_size: "{{ openshift_volume_size | default(500) }}"
+        volume_type: gp3
+        iops: 3000
+        throughput: 125
+        tags:
+          Name: "{{ instance_name }}-openshift-images"
+          Purpose: openshift-vm-images
+        state: present
+      register: ocp_volume
+      when: existing_ocp_volume.volumes | length == 0
+
+    - name: Use existing OpenShift images volume (same AZ)
+      set_fact:
+        ocp_volume_id: "{{ existing_ocp_volume.volumes[0].id }}"
+      when:
+        - existing_ocp_volume.volumes | length > 0
+        - not ocp_volume_in_wrong_az
+
+    - name: Use newly created OpenShift images volume
+      set_fact:
+        ocp_volume_id: "{{ ocp_volume.volume_id }}"
+      when: existing_ocp_volume.volumes | length == 0
+
+    - name: Attach OpenShift images volume to instance
+      amazon.aws.ec2_vol:
+        region: "{{ aws_region }}"
+        instance: "{{ instance_id }}"
+        id: "{{ ocp_volume_id }}"
+        device_name: /dev/sdg
+        delete_on_termination: false
+        state: present
+
+    - name: Wait for SSH to be available
+      wait_for:
+        host: "{{ instance_public_ip }}"
+        port: 22
+        delay: 10
+        timeout: 300
+
+    - name: Store EC2 public IP as fact
+      set_fact:
+        ec2_public_ip: "{{ instance_public_ip }}"
+        cacheable: yes
+
+    - name: Display instance information
+      debug:
+        msg:
+          - "=========================================="
+          - "EC2 Infrastructure Created"
+          - "=========================================="
+          - "VPC: {{ vpc.vpc.id }} ({{ vpc_cidr }})"
+          - ""
+          - "Subnets created in {{ subnets_result.results | length }} availability zones"
+          - ""
+          - "Instance Details:"
+          - "  Instance ID: {{ instance_id }}"
+          - "  Instance Type: {{ instance_type }}"
+          - "  Public IP: {{ instance_public_ip }}"
+          - "  Subnet: {{ ec2_info.instances[0].subnet_id }}"
+          - "  Availability Zone: {{ ec2_info.instances[0].placement.availability_zone }}"
+          - "{% if launch_successful | default(false) %}  Note: Launched in {{ launch_az }} after trying {{ subnets_result.results | length }} AZ(s){% endif %}"
+          - "=========================================="
+
+- name: Configure nested virtualization on EC2 instance
+  hosts: nested_virt_hosts
+  become: true
+  gather_facts: true
+  vars:
+    cockpit_admin_user: admin
+    cockpit_admin_password: "ChangeMe123!"  # Change this to a secure password
+
+  pre_tasks:
+    - name: Display virtualization setup phase
+      debug:
+        msg:
+          - "=========================================="
+          - "Phase 2: Virtualization Setup"
+          - "=========================================="
+          - ""
+          - "Configuring KVM and libvirt on EC2 instance"
+          - "  - Install virtualization packages"
+          - "  - Configure networking bridges"
+          - "  - Setup Redfish BMC (sushy-tools)"
+          - "  - Install Cockpit web console"
+          - ""
+          - "Estimated time: 10-15 minutes"
+          - "=========================================="
+
+  tasks:
+    - name: Update all packages
+      ansible.builtin.dnf:
+        name: '*'
+        state: latest
+        update_cache: yes
+
+    - name: Install virtualization host environment group
+      ansible.builtin.dnf:
+        name: '@virtualization-host-environment'
+        state: present
+
+    - name: Install additional RHEL virtualization packages
+      ansible.builtin.dnf:
+        name:
+          - qemu-kvm
+          - libvirt
+          - libvirt-daemon-kvm
+          - libvirt-daemon-config-network
+          - libvirt-daemon-config-nwfilter
+          - virt-install
+          - virt-viewer
+          - virt-top
+          - libguestfs
+          - libguestfs-tools
+          - libguestfs-tools-c
+          - python3-libguestfs
+          - guestfs-tools
+          - cockpit
+          - cockpit-machines
+          - cockpit-storaged
+          - cockpit-podman
+        state: present
+
+    - name: Install network utilities and tools
+      ansible.builtin.dnf:
+        name:
+          - net-tools
+          - iproute
+          - NetworkManager
+          - xfsprogs
+          - tmux
+        state: present
+
+    - name: Ensure NetworkManager is running
+      ansible.builtin.systemd:
+        name: NetworkManager
+        state: started
+        enabled: true
+
+    - name: Get primary network interface name
+      ansible.builtin.shell: |
+        ip route | grep default | awk '{print $5}' | head -n1
+      register: primary_interface
+      changed_when: false
+
+    - name: Display primary interface
+      debug:
+        msg: "Primary network interface: {{ primary_interface.stdout }}"
+
+    - name: Check if baremetal bridge connection exists
+      ansible.builtin.shell: nmcli connection show | grep -w baremetal || true
+      register: bridge_exists
+      changed_when: false
+
+    - name: Check if baremetal bridge is active
+      ansible.builtin.shell: nmcli connection show --active | grep -w baremetal || true
+      register: bridge_active
+      changed_when: false
+
+    - name: Get current connection name for primary interface
+      ansible.builtin.shell: |
+        nmcli -t -f NAME,DEVICE connection show --active | grep ":{{ primary_interface.stdout }}$" | cut -d: -f1
+      register: current_connection
+      changed_when: false
+
+    - name: Create baremetal bridge if it doesn't exist
+      ansible.builtin.command: |
+        nmcli connection add type bridge con-name baremetal ifname baremetal \
+          ipv4.method auto \
+          ipv6.method ignore \
+          connection.autoconnect yes \
+          connection.autoconnect-priority 100
+      when: bridge_exists.stdout == ""
+      register: bridge_created
+
+    - name: Add primary interface to baremetal bridge if it doesn't exist
+      ansible.builtin.command: |
+        nmcli connection add type ethernet slave-type bridge \
+          con-name baremetal-slave ifname {{ primary_interface.stdout }} master baremetal \
+          connection.autoconnect yes \
+          connection.autoconnect-priority 100
+      when: bridge_exists.stdout == ""
+      register: bridge_slave_added
+
+    - name: Determine if bridge needs activation
+      set_fact:
+        needs_bridge_activation: "{{ bridge_active.stdout == '' }}"
+
+    - name: Disable autoconnect on old eth0 connection to prevent conflicts on reboot
+      ansible.builtin.command: |
+        nmcli connection modify "{{ current_connection.stdout }}" connection.autoconnect no
+      when:
+        - current_connection.stdout != ""
+        - current_connection.stdout != "baremetal"
+        - needs_bridge_activation
+      ignore_errors: true
+
+    - name: Activate baremetal bridge (network switch)
+      block:
+        - name: Bring down old connection
+          ansible.builtin.shell: nmcli connection down "{{ current_connection.stdout }}"
+          async: 1
+          poll: 0
+          ignore_errors: true
+          when: current_connection.stdout != "" and current_connection.stdout != "baremetal"
+
+        - name: Wait for old connection to go down
+          ansible.builtin.pause:
+            seconds: 3
+
+        - name: Activate baremetal-slave connection
+          ansible.builtin.shell: nmcli connection up baremetal-slave
+          async: 1
+          poll: 0
+
+        - name: Wait for slave to connect
+          ansible.builtin.pause:
+            seconds: 3
+
+        - name: Activate baremetal bridge
+          ansible.builtin.shell: nmcli connection up baremetal
+          async: 1
+          poll: 0
+
+      when: needs_bridge_activation
+
+- name: Wait for network to switch and reconnect
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Save network switch flag
+      set_fact:
+        bridge_was_created: "{{ hostvars[groups['nested_virt_hosts'][0]].bridge_created is defined and hostvars[groups['nested_virt_hosts'][0]].bridge_created.changed }}"
+
+    - name: Wait for network transition
+      ansible.builtin.pause:
+        seconds: 20
+      when: bridge_was_created | bool
+
+    - name: Wait for host to be reachable again
+      ansible.builtin.wait_for:
+        host: "{{ groups['nested_virt_hosts'][0] }}"
+        port: 22
+        delay: 5
+        timeout: 60
+      when: bridge_was_created | bool
+
+- name: Verify bridge is active
+  hosts: nested_virt_hosts
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Verify bridge is active
+      ansible.builtin.shell: ip addr show baremetal
+      register: bridge_status
+      changed_when: false
+
+    - name: Display bridge information
+      debug:
+        msg:
+          - "Baremetal bridge status:"
+          - "{{ bridge_status.stdout_lines }}"
+      when: bridge_status.rc == 0
+
+    - name: Wait for storage device to appear
+      ansible.builtin.wait_for:
+        path: /dev/nvme1n1
+        timeout: 30
+      ignore_errors: true
+
+    - name: Check if storage device exists (alternative naming)
+      ansible.builtin.stat:
+        path: /dev/xvdf
+      register: xvdf_device
+      when: false
+
+    - name: Set storage device path
+      set_fact:
+        storage_device: "{{ '/dev/nvme1n1' if ansible_facts.devices.nvme1n1 is defined else '/dev/xvdf' }}"
+
+    - name: Check if storage filesystem exists
+      ansible.builtin.command: blkid {{ storage_device }}
+      register: blkid_result
+      changed_when: false
+      failed_when: false
+
+    - name: Create XFS filesystem on storage volume
+      community.general.filesystem:
+        fstype: xfs
+        dev: "{{ storage_device }}"
+      when: blkid_result.rc != 0
+
+    - name: Create /storage mount point
+      ansible.builtin.file:
+        path: /storage
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Get UUID of storage device
+      ansible.builtin.command: blkid -s UUID -o value {{ storage_device }}
+      register: storage_uuid
+      changed_when: false
+
+    - name: Mount storage volume at /storage
+      ansible.posix.mount:
+        path: /storage
+        src: "UUID={{ storage_uuid.stdout }}"
+        fstype: xfs
+        opts: defaults,noatime
+        state: mounted
+
+    - name: Ensure storage is in fstab
+      ansible.posix.mount:
+        path: /storage
+        src: "UUID={{ storage_uuid.stdout }}"
+        fstype: xfs
+        opts: defaults,noatime
+        state: present
+
+    - name: Create subdirectories in /storage
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+      loop:
+        - /storage/vms
+        - /storage/isos
+        - /storage/vmedia
+        - /storage/backups
+
+    - name: Set correct SELinux context for storage directories
+      ansible.builtin.command: chcon -R -t virt_image_t /storage/vms
+      changed_when: false
+      ignore_errors: true
+
+    - name: Set correct SELinux context for vmedia directory
+      ansible.builtin.command: chcon -R -t virt_image_t /storage/vmedia
+      changed_when: false
+      ignore_errors: true
+
+    - name: Wait for OpenShift images device to appear
+      ansible.builtin.wait_for:
+        path: /dev/nvme2n1
+        timeout: 30
+      ignore_errors: true
+
+    - name: Set OpenShift images device path
+      set_fact:
+        ocp_device: "{{ '/dev/nvme2n1' if ansible_facts.devices.nvme2n1 is defined else '/dev/xvdg' }}"
+
+    - name: Check if OpenShift images filesystem exists
+      ansible.builtin.command: blkid {{ ocp_device }}
+      register: ocp_blkid_result
+      changed_when: false
+      failed_when: false
+
+    - name: Create XFS filesystem on OpenShift images volume
+      community.general.filesystem:
+        fstype: xfs
+        dev: "{{ ocp_device }}"
+      when: ocp_blkid_result.rc != 0
+
+    - name: Create /var/lib/libvirt/openshift-images mount point
+      ansible.builtin.file:
+        path: /var/lib/libvirt/openshift-images
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Get UUID of OpenShift images device
+      ansible.builtin.command: blkid -s UUID -o value {{ ocp_device }}
+      register: ocp_uuid
+      changed_when: false
+
+    - name: Mount OpenShift images volume
+      ansible.posix.mount:
+        path: /var/lib/libvirt/openshift-images
+        src: "UUID={{ ocp_uuid.stdout }}"
+        fstype: xfs
+        opts: defaults,noatime
+        state: mounted
+
+    - name: Ensure OpenShift images volume is in fstab
+      ansible.posix.mount:
+        path: /var/lib/libvirt/openshift-images
+        src: "UUID={{ ocp_uuid.stdout }}"
+        fstype: xfs
+        opts: defaults,noatime
+        state: present
+
+    - name: Set correct SELinux context for OpenShift images directory
+      ansible.builtin.command: chcon -R -t virt_image_t /var/lib/libvirt/openshift-images
+      changed_when: false
+      ignore_errors: true
+
+    - name: Restore SELinux context recursively
+      ansible.builtin.command: restorecon -Rv /var/lib/libvirt/openshift-images
+      changed_when: false
+      ignore_errors: true
+
+    - name: Check if CPU supports virtualization
+      shell: grep -E '(vmx|svm)' /proc/cpuinfo
+      register: cpu_virt_check
+      changed_when: false
+      failed_when: false
+
+    - name: Determine CPU vendor
+      shell: grep -q 'vmx' /proc/cpuinfo && echo 'intel' || echo 'amd'
+      register: cpu_vendor
+      changed_when: false
+      when: cpu_virt_check.rc == 0
+
+    - name: Load KVM module
+      community.general.modprobe:
+        name: "kvm_{{ cpu_vendor.stdout }}"
+        state: present
+      when: cpu_virt_check.rc == 0
+      ignore_errors: true
+
+    - name: Load main KVM module
+      community.general.modprobe:
+        name: kvm
+        state: present
+      ignore_errors: true
+
+    - name: Disable nested virtualization in KVM module
+      block:
+        - name: Unload KVM vendor module to reconfigure
+          community.general.modprobe:
+            name: "kvm_{{ cpu_vendor.stdout }}"
+            state: absent
+          ignore_errors: true
+
+        - name: Wait for module to unload
+          ansible.builtin.pause:
+            seconds: 2
+
+        - name: Load KVM vendor module with nested disabled
+          ansible.builtin.shell: modprobe kvm_{{ cpu_vendor.stdout }} nested=0
+          when: cpu_vendor.stdout is defined
+
+        - name: Make nested=0 persistent across reboots
+          ansible.builtin.copy:
+            content: |
+              # Disable nested virtualization to prevent KVM hardware errors in L2 guests
+              # This prevents OCP master VMs from seeing VMX/SVM capability
+              options kvm_{{ cpu_vendor.stdout }} nested=0
+            dest: /etc/modprobe.d/kvm-nested.conf
+            mode: '0644'
+          when: cpu_vendor.stdout is defined
+
+      when: cpu_virt_check.rc == 0
+
+    - name: Check nested virtualization status
+      shell: cat /sys/module/kvm_{{ cpu_vendor.stdout }}/parameters/nested
+      register: nested_status
+      changed_when: false
+      when: cpu_virt_check.rc == 0
+      ignore_errors: true
+
+    - name: Display nested virtualization status
+      debug:
+        msg:
+          - "CPU Vendor: {{ cpu_vendor.stdout if cpu_vendor.stdout is defined else 'unknown' }}"
+          - "CPU Virtualization: {{ 'supported (vmx/svm flags present)' if cpu_virt_check.rc == 0 else 'NOT supported' }}"
+          - "KVM Module Loaded: {{ 'yes' if nested_status.rc is defined and nested_status.rc == 0 else 'failed to load' }}"
+          - "KVM Nested Virtualization (OS level): {{ 'DISABLED (' + nested_status.stdout + ') - prevents L2 guest VMX errors' if nested_status.stdout is defined and nested_status.stdout == 'N' else 'UNEXPECTED STATE: ' + (nested_status.stdout | default('unknown')) }}"
+          - "Note: Nested virt is DISABLED to prevent KVM hardware errors in OCP masters"
+
+    - name: Start and enable libvirtd service
+      ansible.builtin.systemd:
+        name: libvirtd
+        state: started
+        enabled: true
+
+    - name: Configure firewalld for libvirt
+      ansible.posix.firewalld:
+        zone: public
+        service: libvirt
+        permanent: yes
+        state: enabled
+      notify: reload firewalld
+      ignore_errors: true
+
+    - name: Configure firewalld for Cockpit
+      ansible.posix.firewalld:
+        zone: public
+        service: cockpit
+        permanent: yes
+        state: enabled
+      notify: reload firewalld
+      ignore_errors: true
+
+    - name: Start and enable cockpit socket
+      ansible.builtin.systemd:
+        name: cockpit.socket
+        state: started
+        enabled: true
+
+    - name: Install Python pip and development tools for Sushy
+      ansible.builtin.dnf:
+        name:
+          - python3-pip
+          - python3-devel
+          - gcc
+        state: present
+
+    - name: Install Sushy-tools for Redfish emulation
+      ansible.builtin.pip:
+        name:
+          - sushy-tools
+          - Flask
+        state: present
+        executable: pip3
+
+    - name: Create Sushy configuration directory
+      ansible.builtin.file:
+        path: /etc/sushy
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Create Sushy vmedia parent directory
+      ansible.builtin.file:
+        path: /var/lib/sushy
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Create symbolic link for Sushy vmedia compatibility
+      ansible.builtin.file:
+        src: /storage/vmedia
+        dest: /var/lib/sushy/vmedia
+        state: link
+        force: yes
+
+    - name: Generate self-signed certificate for Sushy
+      ansible.builtin.shell: |
+        openssl req -new -x509 -days 3650 -nodes \
+          -out /etc/sushy/sushy.crt \
+          -keyout /etc/sushy/sushy.key \
+          -subj "/C=US/ST=State/L=City/O=Lab/CN={{ ansible_default_ipv4.address }}"
+      args:
+        creates: /etc/sushy/sushy.crt
+
+    - name: Set permissions on Sushy certificate
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: '0600'
+        owner: root
+        group: root
+      loop:
+        - /etc/sushy/sushy.crt
+        - /etc/sushy/sushy.key
+
+    - name: Configure Sushy emulator with TLS
+      ansible.builtin.copy:
+        content: |
+          SUSHY_EMULATOR_LISTEN_IP = '0.0.0.0'
+          SUSHY_EMULATOR_LISTEN_PORT = 8000
+          SUSHY_EMULATOR_SSL_CERT = '/etc/sushy/sushy.crt'
+          SUSHY_EMULATOR_SSL_KEY = '/etc/sushy/sushy.key'
+          SUSHY_EMULATOR_OS_CLOUD = None
+          SUSHY_EMULATOR_LIBVIRT_URI = 'qemu:///system'
+          SUSHY_EMULATOR_IGNORE_BOOT_DEVICE = False
+          SUSHY_EMULATOR_VMEDIA_DEVICES = {
+              'Cd': {
+                  'Name': 'Virtual CD',
+                  'MediaTypes': ['CD', 'DVD']
+              },
+              'Floppy': {
+                  'Name': 'Virtual Floppy',
+                  'MediaTypes': ['Floppy', 'USBStick']
+              }
+          }
+          SUSHY_EMULATOR_VMEDIA_VERIFY_SSL = False
+          SUSHY_EMULATOR_STORAGE_BACKEND = '/storage/vmedia'
+        dest: /etc/sushy/sushy-emulator.conf
+        mode: '0644'
+        owner: root
+        group: root
+      notify: restart sushy-emulator
+
+    - name: Create Sushy systemd service
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Sushy Redfish Emulator
+          After=network.target libvirtd.service
+          Wants=libvirtd.service
+
+          [Service]
+          Type=simple
+          User=root
+          Group=root
+          Environment="SUSHY_EMULATOR_CONFIG=/etc/sushy/sushy-emulator.conf"
+          ExecStart=/usr/local/bin/sushy-emulator
+          Restart=on-failure
+          RestartSec=5s
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/sushy-emulator.service
+        mode: '0644'
+        owner: root
+        group: root
+      notify: reload systemd
+
+    - name: Configure firewalld for Sushy Redfish (port 8000 - public zone)
+      ansible.posix.firewalld:
+        zone: public
+        port: 8000/tcp
+        permanent: yes
+        state: enabled
+      notify: reload firewalld
+      ignore_errors: true
+
+    - name: Configure firewalld for Sushy Redfish (port 8000 - libvirt zone)
+      ansible.posix.firewalld:
+        zone: libvirt
+        port: 8000/tcp
+        permanent: yes
+        state: enabled
+      notify: reload firewalld
+      ignore_errors: true
+
+    - name: Start and enable Sushy emulator service
+      ansible.builtin.systemd:
+        name: sushy-emulator
+        state: started
+        enabled: true
+        daemon_reload: yes
+
+    - name: Create symbolic link for compatibility
+      ansible.builtin.file:
+        src: /storage/vms
+        dest: /var/lib/libvirt/images
+        state: link
+        force: yes
+
+    - name: Define default storage pool (using /storage/vms)
+      community.libvirt.virt_pool:
+        command: define
+        name: default
+        xml: |
+          <pool type='dir'>
+            <name>default</name>
+            <target>
+              <path>/storage/vms</path>
+            </target>
+          </pool>
+      ignore_errors: true
+
+    - name: Start and autostart default storage pool
+      community.libvirt.virt_pool:
+        name: default
+        state: active
+        autostart: true
+      ignore_errors: true
+
+    - name: Check if default network exists
+      ansible.builtin.shell: virsh net-list --all --name | grep -E "^default$" || echo ""
+      register: default_net_exists
+      changed_when: false
+
+    - name: Destroy and undefine existing default network
+      block:
+        - name: Destroy default network
+          ansible.builtin.shell: virsh net-destroy default
+          ignore_errors: true
+
+        - name: Undefine default network
+          ansible.builtin.shell: virsh net-undefine default
+          ignore_errors: true
+
+        - name: Wait for network cleanup
+          ansible.builtin.pause:
+            seconds: 2
+      when: default_net_exists.stdout != ""
+
+    - name: Create network XML file with updated DHCP range
+      ansible.builtin.copy:
+        content: |
+          <network>
+            <name>default</name>
+            <forward mode='nat'/>
+            <bridge name='virbr0' stp='on' delay='0'/>
+            <ip address='192.168.122.1' netmask='255.255.255.0'>
+              <dhcp>
+                <!-- DHCP: 192.168.122.100-254 (155 IPs) -->
+                <!-- Static: 192.168.122.2-99 (98 IPs available for OpenShift, etc.) -->
+                <range start='192.168.122.100' end='192.168.122.254'/>
+                <!-- Explicitly set subnet mask and gateway via DHCP options -->
+                <option type='1' value='255.255.255.0'/>
+                <option type='3' value='192.168.122.1'/>
+              </dhcp>
+            </ip>
+          </network>
+        dest: /tmp/default-network.xml
+        mode: '0644'
+
+    - name: Define default network from XML
+      ansible.builtin.shell: virsh net-define /tmp/default-network.xml
+
+    - name: Start default network
+      ansible.builtin.shell: virsh net-start default
+
+    - name: Autostart default network
+      ansible.builtin.shell: virsh net-autostart default
+
+    - name: Cleanup network XML file
+      ansible.builtin.file:
+        path: /tmp/default-network.xml
+        state: absent
+
+    - name: Wait for network to be fully active
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: Verify DHCP range
+      ansible.builtin.shell: virsh net-dumpxml default | grep -A 1 "<dhcp>"
+      register: dhcp_verify
+      changed_when: false
+
+    - name: Display DHCP configuration
+      debug:
+        msg: "{{ dhcp_verify.stdout_lines }}"
+
+    - name: Ensure default network is started and active
+      community.libvirt.virt_net:
+        name: default
+        state: active
+        autostart: true
+
+    - name: Wait for virbr0 to come up
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: Check if dummy VM exists to keep virbr0 UP
+      ansible.builtin.shell: virsh list --all --name | grep -E "^virbr0-keepalive$" || echo ""
+      register: dummy_vm_exists
+      changed_when: false
+
+    - name: Create tiny dummy VM to keep virbr0 UP and visible
+      ansible.builtin.shell: |
+        virt-install \
+          --name virbr0-keepalive \
+          --memory 256 \
+          --vcpus 1 \
+          --disk size=1,format=qcow2,bus=virtio \
+          --network bridge=virbr0 \
+          --boot network \
+          --graphics none \
+          --noautoconsole \
+          --os-variant generic \
+          --noreboot
+      when: dummy_vm_exists.stdout == ""
+
+    - name: Start dummy VM
+      ansible.builtin.shell: virsh start virbr0-keepalive 2>&1 || true
+      changed_when: false
+
+    - name: Set dummy VM to autostart
+      ansible.builtin.shell: virsh autostart virbr0-keepalive
+      ignore_errors: true
+
+    - name: Wait for virbr0 to get carrier from VM
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Verify virbr0 bridge status
+      ansible.builtin.shell: ip link show virbr0
+      register: virbr0_status
+      changed_when: false
+
+    - name: Display virbr0 status
+      debug:
+        msg: "{{ virbr0_status.stdout_lines }}"
+
+    - name: Add ec2-user to libvirt group
+      ansible.builtin.user:
+        name: ec2-user
+        groups: libvirt
+        append: true
+
+    - name: Create Cockpit admin user with sudo access
+      ansible.builtin.user:
+        name: "{{ cockpit_admin_user }}"
+        groups: wheel
+        append: true
+        create_home: true
+        shell: /bin/bash
+        password: "{{ cockpit_admin_password | password_hash('sha512') }}"
+        state: present
+
+    - name: Ensure wheel group has sudo access
+      ansible.builtin.lineinfile:
+        path: /etc/sudoers
+        state: present
+        regexp: '^%wheel'
+        line: '%wheel ALL=(ALL) ALL'
+        validate: '/usr/sbin/visudo -cf %s'
+
+    - name: Add admin user to libvirt group
+      ansible.builtin.user:
+        name: "{{ cockpit_admin_user }}"
+        groups: libvirt
+        append: true
+
+    - name: Get EC2 public IP from hostvars
+      set_fact:
+        public_ip: "{{ hostvars['localhost']['ec2_public_ip'] }}"
+
+    - name: Display host information
+      debug:
+        msg:
+          - "=========================================="
+          - "KVM nested virtualization host is ready!"
+          - "=========================================="
+          - ""
+          - "Cockpit Web Console:"
+          - "  URL: https://{{ public_ip }}:9090"
+          - "  Username: {{ cockpit_admin_user }}"
+          - "  Password: {{ cockpit_admin_password }}"
+          - ""
+          - "Redfish API (Sushy Emulator):"
+          - "  URL: http://{{ public_ip }}:8000/redfish/v1/"
+          - "  Systems: http://{{ public_ip }}:8000/redfish/v1/Systems"
+          - "  Virtual Media: http://{{ public_ip }}:8000/redfish/v1/Systems/{vm}/VirtualMedia"
+          - ""
+          - "SSH Access:"
+          - "  ssh ec2-user@{{ public_ip }}"
+          - ""
+          - "VM Management Commands:"
+          - "  - List VMs: sudo virsh list --all"
+          - "  - Create VM: sudo virt-install ..."
+          - "  - Console: sudo virsh console <vm-name>"
+          - ""
+          - "Redfish Commands:"
+          - "  - List systems: curl http://{{ public_ip }}:8000/redfish/v1/Systems"
+          - "  - Check service: sudo systemctl status sushy-emulator"
+          - ""
+          - "OpenShift Tools:"
+          - "  - OpenShift installer: openshift-install version"
+          - "  - OpenShift client: oc version"
+          - "  - Kubernetes client: kubectl version --client"
+          - ""
+          - "Note: You may need to reconnect SSH for group changes to take effect"
+          - "=========================================="
+
+  handlers:
+    - name: reload firewalld
+      ansible.builtin.systemd:
+        name: firewalld
+        state: reloaded
+
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: restart sushy-emulator
+      ansible.builtin.systemd:
+        name: sushy-emulator
+        state: restarted
+        daemon_reload: yes
+
+- name: Install OpenShift CLI tools
+  hosts: nested_virt_hosts
+  become: true
+  gather_facts: false
+
+  roles:
+    - openshift_cli
+
+- name: Configure DNS server for OpenShift
+  hosts: nested_virt_hosts
+  become: true
+  gather_facts: true
+  vars:
+    # Override dns_domain if needed
+    # dns_domain: example.com
+
+  pre_tasks:
+    - name: Display DNS configuration phase
+      debug:
+        msg:
+          - "=========================================="
+          - "Phase 3: DNS Configuration"
+          - "=========================================="
+          - ""
+          - "Configuring BIND DNS server for OpenShift"
+          - "  - Install BIND packages"
+          - "  - Configure DNS zones"
+          - "  - Create OpenShift DNS records"
+          - ""
+          - "Estimated time: 2-3 minutes"
+          - "=========================================="
+
+  roles:
+    - configure_dns
+
+- name: Prepare OpenShift installation
+  hosts: nested_virt_hosts
+  become: false
+  gather_facts: true
+  vars:
+    # Override these variables as needed
+    # ocp_cluster_name: ocp
+    # ocp_base_domain: example.com
+
+  pre_tasks:
+    - name: Display OpenShift preparation phase
+      debug:
+        msg:
+          - "=========================================="
+          - "Phase 4: OpenShift Preparation"
+          - "=========================================="
+          - ""
+          - "Preparing OpenShift environment"
+          - "  - Create master VMs (3 nodes)"
+          - "  - Generate install-config.yaml"
+          - "  - Configure network settings"
+          - "  - Setup Redfish BMC access"
+          - ""
+          - "Estimated time: 5-10 minutes"
+          - "=========================================="
+
+  roles:
+    - openshift_install
+
+- name: Install OpenShift cluster
+  hosts: nested_virt_hosts
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Display installation phase
+      debug:
+        msg:
+          - "=========================================="
+          - "Phase 5: OpenShift Cluster Installation"
+          - "=========================================="
+          - ""
+          - "Starting OpenShift cluster installation:"
+          - "  - Run openshift-install in tmux session"
+          - "  - Monitor progress (polling every 30s)"
+          - "  - Configure kubeconfig files"
+          - "  - Display access credentials"
+          - ""
+          - "Estimated time: 45-60 minutes"
+          - ""
+          - "You can safely interrupt this playbook."
+          - "The installation will continue in tmux."
+          - ""
+          - "To monitor manually:"
+          - "  ssh ec2-user@{{ ansible_host }}"
+          - "  tmux attach -t openshift-install"
+          - "=========================================="
+
+  roles:
+    - openshift_install_cluster
+
+  post_tasks:
+    - name: Display completion summary
+      debug:
+        msg:
+          - "=========================================="
+          - "✓ Complete OpenShift Setup Finished"
+          - "=========================================="
+          - ""
+          - "All components are now configured:"
+          - "  ✓ AWS EC2 instance with nested virtualization"
+          - "  ✓ DNS server for OpenShift domains"
+          - "  ✓ Master VMs created and ready"
+          - "  ✓ OpenShift cluster installed"
+          - ""
+          - "Access information saved to:"
+          - "  /home/ec2-user/openshift-cluster-access.txt"
+          - ""
+          - "Quick access:"
+          - "  ssh ec2-user@{{ ansible_host }}"
+          - "  cat ~/openshift-cluster-access.txt"
+          - ""
+          - "=========================================="

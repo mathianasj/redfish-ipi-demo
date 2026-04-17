@@ -1,0 +1,143 @@
+---
+# Attempt to migrate to a specific instance type
+# candidate structure: [Type, VCpus, Memory, Arch, cpu_increase%, memory_increase%, total_increase%]
+
+- name: Display attempt
+  debug:
+    msg: "Attempting {{ candidate[0] }}: {{ candidate[1] }} vCPUs (+{{ candidate[4] | round(1) }}%), {{ (candidate[2] / 1024) | round(1) }} GiB (+{{ candidate[5] | round(1) }}%)"
+
+- name: Increment attempt counter
+  set_fact:
+    attempts_made: "{{ attempts_made | int + 1 }}"
+
+- name: Modify instance type
+  shell: |
+    aws ec2 modify-instance-attribute \
+      --region {{ aws_region }} \
+      --instance-id {{ instance_id }} \
+      --instance-type {{ candidate[0] }}
+  register: modify_result
+  changed_when: false
+
+- name: Wait for modification to apply
+  pause:
+    seconds: 3
+
+- name: Attempt to start instance
+  amazon.aws.ec2_instance:
+    instance_ids:
+      - "{{ instance_id }}"
+    state: started
+    region: "{{ aws_region }}"
+    wait: false
+  register: start_attempt
+  ignore_errors: true
+
+- name: Wait for instance state to settle
+  pause:
+    seconds: 5
+
+- name: Check instance state
+  amazon.aws.ec2_instance_info:
+    region: "{{ aws_region }}"
+    instance_ids:
+      - "{{ instance_id }}"
+  register: instance_check
+  retries: 3
+  delay: 2
+
+- name: Check for InsufficientInstanceCapacity in state reason
+  set_fact:
+    capacity_error: "{{ instance_check.instances[0].state_reason is defined and 'InsufficientInstanceCapacity' in (instance_check.instances[0].state_reason.message | default('')) }}"
+    instance_running: "{{ instance_check.instances[0].state.name == 'running' }}"
+    instance_pending: "{{ instance_check.instances[0].state.name == 'pending' }}"
+
+- name: Wait for instance to reach running state if pending
+  amazon.aws.ec2_instance_info:
+    region: "{{ aws_region }}"
+    instance_ids:
+      - "{{ instance_id }}"
+  register: running_check
+  retries: 60
+  delay: 5
+  until: running_check.instances[0].state.name in ['running', 'stopped']
+  when: instance_pending
+
+- name: Update running status
+  set_fact:
+    instance_running: "{{ running_check.instances[0].state.name == 'running' }}"
+  when: instance_pending
+
+- name: Handle success
+  block:
+    - name: Mark migration as successful
+      set_fact:
+        migration_successful: true
+        successful_type: "{{ candidate[0] }}"
+
+    - name: Get final instance info
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        instance_ids:
+          - "{{ instance_id }}"
+      register: final_info
+
+    - name: Display success details
+      debug:
+        msg:
+          - "✓ SUCCESS! Instance started with {{ candidate[0] }}"
+          - "  vCPUs: {{ current_vcpus }} → {{ candidate[1] }} (+{{ candidate[4] | round(1) }}%)"
+          - "  Memory: {{ (current_memory_mib / 1024) | round(1) }} GiB → {{ (candidate[2] / 1024) | round(1) }} GiB (+{{ candidate[5] | round(1) }}%)"
+          - "  Public IP: {{ final_info.instances[0].public_ip_address | default('N/A') }}"
+          - "  State: {{ final_info.instances[0].state.name }}"
+
+  when: instance_running
+
+- name: Handle capacity failure
+  block:
+    - name: Display capacity failure
+      debug:
+        msg: "✗ FAILED: {{ candidate[0] }} - InsufficientInstanceCapacity in {{ availability_zone }}"
+
+    - name: Stop instance
+      amazon.aws.ec2_instance:
+        instance_ids:
+          - "{{ instance_id }}"
+        state: stopped
+        region: "{{ aws_region }}"
+        wait: true
+        wait_timeout: 300
+      ignore_errors: true
+
+    - name: Wait for stopped state
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        instance_ids:
+          - "{{ instance_id }}"
+      register: stopped_check
+      retries: 30
+      delay: 5
+      until: stopped_check.instances[0].state.name == "stopped"
+
+    - name: Revert to original instance type
+      shell: |
+        aws ec2 modify-instance-attribute \
+          --region {{ aws_region }} \
+          --instance-id {{ instance_id }} \
+          --instance-type {{ current_instance_type }}
+      register: revert_result
+
+    - name: Wait after revert
+      pause:
+        seconds: 3
+
+    - name: Display revert confirmation
+      debug:
+        msg: "Reverted to {{ current_instance_type }}, trying next candidate..."
+
+  when: not instance_running
+
+- name: Pause between attempts to avoid rate limiting
+  pause:
+    seconds: 2
+  when: not migration_successful

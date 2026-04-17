@@ -1,0 +1,104 @@
+---
+- name: Find EC2 instance
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    aws_region: us-east-2
+    instance_name: nested-virt-host
+    ssh_private_key_path: "~/.ssh/id_rsa_fips"
+
+  tasks:
+    - name: Find EC2 instance by name
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+          "instance-state-name": ["running"]
+      register: instance_info
+
+    - name: Verify instance exists
+      fail:
+        msg: "No running EC2 instance found with name '{{ instance_name }}' in region {{ aws_region }}"
+      when: instance_info.instances | length == 0
+
+    - name: Add EC2 instance to inventory
+      add_host:
+        hostname: "{{ instance_info.instances[0].public_ip_address }}"
+        groupname: nested_virt_hosts
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: "{{ ssh_private_key_path }}"
+
+    - name: Display instance information
+      debug:
+        msg:
+          - "Found EC2 instance: {{ instance_name }}"
+          - "Public IP: {{ instance_info.instances[0].public_ip_address }}"
+          - "Instance ID: {{ instance_info.instances[0].instance_id }}"
+
+- name: Setup VNC GUI on EC2 Instance
+  hosts: nested_virt_hosts
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Display setup information
+      debug:
+        msg:
+          - "=========================================="
+          - "noVNC Web-Based GUI Setup"
+          - "=========================================="
+          - ""
+          - "This playbook will:"
+          - "  1. Install GNOME desktop environment"
+          - "  2. Install and configure TigerVNC server (localhost only)"
+          - "  3. Install noVNC web-based VNC client"
+          - "  4. Configure HTTP (port {{ novnc_http_port | default(6080) }}) and HTTPS (port {{ novnc_https_port | default(6081) }})"
+          - "  5. Generate self-signed SSL certificate"
+          - "  6. Open firewall ports"
+          - "  7. Update AWS security group"
+          - "  8. Install OpenShift CA certificate"
+          - "  9. Install Firefox browser"
+          - ""
+          - "VNC Password: {{ vnc_password | default('redhat123') }}"
+          - ""
+          - "Access via web browser - no VNC client needed!"
+          - ""
+          - "Installation may take 5-10 minutes..."
+          - "=========================================="
+
+  roles:
+    - configure_vnc_gui
+
+  post_tasks:
+    - name: Display connection instructions
+      debug:
+        msg:
+          - "=========================================="
+          - "noVNC Web-Based GUI Setup Complete!"
+          - "=========================================="
+          - ""
+          - "Access desktop via web browser (NO VNC CLIENT NEEDED):"
+          - ""
+          - "HTTPS Access (Recommended - Encrypted):"
+          - "  https://{{ ansible_host }}:{{ novnc_https_port | default(6081) }}/vnc.html"
+          - ""
+          - "HTTP Access (Unencrypted):"
+          - "  http://{{ ansible_host }}:{{ novnc_http_port | default(6080) }}/vnc.html"
+          - ""
+          - "VNC Password: {{ vnc_password | default('redhat123') }}"
+          - ""
+          - "Instructions:"
+          - "  1. Open URL in any web browser"
+          - "  2. Accept certificate warning (HTTPS only)"
+          - "  3. Click 'Connect' button"
+          - "  4. Enter VNC password"
+          - "  5. Desktop appears in browser!"
+          - ""
+          - "Supported browsers: Chrome, Firefox, Safari, Edge, mobile browsers"
+          - ""
+          - "Security group and firewall configured."
+          - "OpenShift CA certificate installed and trusted."
+          - "VNC server running on localhost only (accessed via noVNC)."
+          - ""
+          - "=========================================="

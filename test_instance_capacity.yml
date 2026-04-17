@@ -1,0 +1,59 @@
+---
+# Test if a specific instance type has available capacity using DryRun
+
+- name: Display testing message
+  debug:
+    msg: "Testing capacity for {{ test_type }}..."
+
+- name: Attempt dry-run launch to check capacity
+  shell: |
+    aws ec2 run-instances \
+      --region {{ aws_region }} \
+      --instance-type {{ test_type }} \
+      --image-id {{ ami_id }} \
+      --subnet-id {{ subnet_id }} \
+      --dry-run \
+      2>&1
+  register: dryrun_result
+  failed_when: false
+  changed_when: false
+
+- name: Check for DryRunOperation (indicates capacity is available)
+  set_fact:
+    has_capacity: "{{ 'DryRunOperation' in dryrun_result.stderr }}"
+    insufficient_capacity: "{{ 'InsufficientInstanceCapacity' in dryrun_result.stderr }}"
+    unsupported: "{{ 'Unsupported' in dryrun_result.stderr or 'not supported' in dryrun_result.stderr }}"
+
+- name: Determine result status
+  set_fact:
+    test_status: "{{ 'AVAILABLE' if has_capacity else ('INSUFFICIENT_CAPACITY' if insufficient_capacity else ('UNSUPPORTED' if unsupported else 'UNKNOWN_ERROR')) }}"
+
+- name: Display test result
+  debug:
+    msg: "{{ test_type }}: {{ test_status }}"
+
+- name: Add to available list if capacity exists
+  set_fact:
+    available_types: "{{ available_types | default([]) + [test_type] }}"
+    available_with_capacity: "{{ available_with_capacity | default([]) + [test_type] }}"
+  when: has_capacity | bool
+
+- name: Add to unavailable list if no capacity
+  set_fact:
+    unavailable_types: "{{ unavailable_types | default([]) + [test_type] }}"
+    unavailable_capacity: "{{ unavailable_capacity | default([]) + [test_type] }}"
+  when: insufficient_capacity | bool
+
+- name: Track unsupported types
+  set_fact:
+    unavailable_types: "{{ unavailable_types | default([]) + [test_type + ' (unsupported configuration)'] }}"
+    unavailable_capacity: "{{ unavailable_capacity | default([]) + [test_type + ' (unsupported configuration)'] }}"
+  when: unsupported | bool
+
+- name: Add detailed result to capacity_results
+  set_fact:
+    capacity_results: "{{ capacity_results | default([]) + [{'type': test_type, 'status': test_status, 'message': dryrun_result.stderr}] }}"
+
+- name: Pause between tests to avoid rate limiting
+  pause:
+    seconds: 1

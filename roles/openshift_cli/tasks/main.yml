@@ -1,0 +1,129 @@
+---
+- name: Ensure /usr/local/bin is in ec2-user's PATH
+  ansible.builtin.lineinfile:
+    path: /home/ec2-user/.bashrc
+    line: 'export PATH="/usr/local/bin:$PATH"'
+    regexp: '^export PATH="/usr/local/bin'
+    state: present
+    create: yes
+    owner: ec2-user
+    group: ec2-user
+    mode: '0644'
+
+- name: Ensure /usr/local/bin is in ec2-user's bash_profile
+  ansible.builtin.lineinfile:
+    path: /home/ec2-user/.bash_profile
+    line: 'export PATH="/usr/local/bin:$PATH"'
+    regexp: '^export PATH="/usr/local/bin'
+    state: present
+    create: yes
+    owner: ec2-user
+    group: ec2-user
+    mode: '0644'
+
+- name: Create temporary download directory
+  ansible.builtin.file:
+    path: /tmp/ocp-download
+    state: directory
+    mode: '0755'
+
+- name: Download OpenShift 4.20 installer
+  ansible.builtin.get_url:
+    url: https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest-4.20/openshift-install-linux.tar.gz
+    dest: /tmp/ocp-download/openshift-install-linux.tar.gz
+    mode: '0644'
+    timeout: 300
+
+- name: Download OpenShift 4.20 client tools
+  ansible.builtin.get_url:
+    url: https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest-4.20/openshift-client-linux.tar.gz
+    dest: /tmp/ocp-download/openshift-client-linux.tar.gz
+    mode: '0644'
+    timeout: 300
+
+- name: Extract openshift-install
+  ansible.builtin.unarchive:
+    src: /tmp/ocp-download/openshift-install-linux.tar.gz
+    dest: /tmp/ocp-download/
+    remote_src: yes
+    creates: /tmp/ocp-download/openshift-install
+
+- name: Extract oc client
+  ansible.builtin.unarchive:
+    src: /tmp/ocp-download/openshift-client-linux.tar.gz
+    dest: /tmp/ocp-download/
+    remote_src: yes
+    creates: /tmp/ocp-download/oc
+
+- name: List extracted files for debugging
+  ansible.builtin.shell: ls -la /tmp/ocp-download/
+  register: extracted_files
+  changed_when: false
+
+- name: Display extracted files
+  debug:
+    msg: "{{ extracted_files.stdout_lines }}"
+
+- name: Check if openshift-install binary exists
+  ansible.builtin.stat:
+    path: /tmp/ocp-download/openshift-install
+  register: openshift_install_stat
+
+- name: Check if oc binary exists
+  ansible.builtin.stat:
+    path: /tmp/ocp-download/oc
+  register: oc_stat
+
+- name: Fail if openshift-install not found
+  fail:
+    msg: "openshift-install binary not found in /tmp/ocp-download/ after extraction"
+  when: not openshift_install_stat.stat.exists
+
+- name: Fail if oc not found
+  fail:
+    msg: "oc binary not found in /tmp/ocp-download/ after extraction"
+  when: not oc_stat.stat.exists
+
+- name: Install openshift-install to /usr/local/bin
+  ansible.builtin.copy:
+    src: /tmp/ocp-download/openshift-install
+    dest: /usr/local/bin/openshift-install
+    mode: '0755'
+    remote_src: yes
+
+- name: Install oc to /usr/local/bin
+  ansible.builtin.copy:
+    src: /tmp/ocp-download/oc
+    dest: /usr/local/bin/oc
+    mode: '0755'
+    remote_src: yes
+
+- name: Create kubectl symlink to oc
+  ansible.builtin.file:
+    src: /usr/local/bin/oc
+    dest: /usr/local/bin/kubectl
+    state: link
+
+- name: Cleanup download directory
+  ansible.builtin.file:
+    path: /tmp/ocp-download
+    state: absent
+
+- name: Verify openshift-install installation
+  ansible.builtin.command: /usr/local/bin/openshift-install version
+  register: openshift_install_version
+  changed_when: false
+
+- name: Verify oc installation
+  ansible.builtin.command: /usr/local/bin/oc version --client
+  register: oc_version
+  changed_when: false
+
+- name: Display installed versions
+  debug:
+    msg:
+      - "OpenShift Installer version:"
+      - "{{ openshift_install_version.stdout_lines }}"
+      - ""
+      - "OpenShift Client (oc) version:"
+      - "{{ oc_version.stdout_lines }}"

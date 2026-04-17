@@ -1,0 +1,204 @@
+---
+- name: Find and validate instance types with actual available capacity
+  hosts: localhost
+  gather_facts: false
+  vars:
+    aws_region: us-east-2
+    instance_name: nested-virt-host
+    max_types_to_test: 15  # Limit testing to avoid long run times
+
+  tasks:
+    - name: Find existing EC2 instance
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+      register: instance_info
+
+    - name: Fail if instance not found
+      fail:
+        msg: "No instance found with Name tag: {{ instance_name }}"
+      when: instance_info.instances | length == 0
+
+    - name: Set current instance facts
+      set_fact:
+        instance_id: "{{ instance_info.instances[0].instance_id }}"
+        current_instance_type: "{{ instance_info.instances[0].instance_type }}"
+        availability_zone: "{{ instance_info.instances[0].placement.availability_zone }}"
+        current_cpu_options: "{{ instance_info.instances[0].cpu_options }}"
+        subnet_id: "{{ instance_info.instances[0].subnet_id }}"
+        ami_id: "{{ instance_info.instances[0].image_id }}"
+
+    - name: Get current instance specs
+      shell: |
+        aws ec2 describe-instance-types \
+          --region {{ aws_region }} \
+          --instance-types {{ current_instance_type }} \
+          --query 'InstanceTypes[0].[VCpuInfo.DefaultVCpus, MemoryInfo.SizeInMiB]' \
+          --output text
+      register: current_specs
+      changed_when: false
+
+    - name: Parse current instance specs
+      set_fact:
+        current_vcpus: "{{ current_specs.stdout.split()[0] | int }}"
+        current_memory_mib: "{{ current_specs.stdout.split()[1] | int }}"
+
+    - name: Display search criteria
+      debug:
+        msg:
+          - "=========================================="
+          - "Searching for Alternatives"
+          - "=========================================="
+          - "Current: {{ current_instance_type }} ({{ current_vcpus }} vCPUs, {{ (current_memory_mib / 1024) | round(1) }} GiB)"
+          - "Zone: {{ availability_zone }}"
+          - "Requirements: >= {{ current_vcpus }} vCPUs, >= {{ (current_memory_mib / 1024) | round(1) }} GiB, nested virtualization"
+          - "Will test up to {{ max_types_to_test }} alternatives for actual capacity"
+
+    - name: Get all instance types available in the availability zone
+      shell: |
+        aws ec2 describe-instance-type-offerings \
+          --region {{ aws_region }} \
+          --location-type availability-zone \
+          --filters Name=location,Values={{ availability_zone }} \
+          --query 'InstanceTypeOfferings[].InstanceType' \
+          --output text
+      register: available_types
+      changed_when: false
+
+    - name: Convert available types to list
+      set_fact:
+        available_types_list: "{{ available_types.stdout.split() }}"
+
+    - name: Display instance count to query
+      debug:
+        msg: "Found {{ available_types_list | length }} instance types in {{ availability_zone }}, querying for nested virtualization support..."
+
+    - name: Initialize candidate list
+      set_fact:
+        all_candidate_types: []
+
+    - name: Query instance types in batches
+      include_tasks: query_nested_virt_batch.yml
+      loop: "{{ range(0, available_types_list | length, 100) | list }}"
+      loop_control:
+        loop_var: batch_start
+
+    - name: Filter by CPU and memory requirements and exclude bare metal
+      set_fact:
+        suitable_types: "{{ all_candidate_types |
+          selectattr('1', '>=', current_vcpus) |
+          selectattr('2', '>=', current_memory_mib) |
+          rejectattr('0', 'search', '\\.metal') |
+          sort(attribute='1') |
+          list }}"
+
+    - name: Extract just the instance type names for testing
+      set_fact:
+        types_to_test: "{{ (suitable_types | map(attribute='0') | list)[:max_types_to_test] }}"
+
+    - name: Display candidates found
+      debug:
+        msg:
+          - "Found {{ suitable_types | length }} instance types with nested virtualization meeting requirements"
+          - "Testing first {{ types_to_test | length }} for actual capacity..."
+
+    - name: Initialize capacity results
+      set_fact:
+        available_with_capacity: []
+        unavailable_capacity: []
+
+    - name: Test each instance type for actual capacity
+      include_tasks: test_instance_capacity.yml
+      loop: "{{ types_to_test }}"
+      loop_control:
+        loop_var: test_type
+
+    - name: Display final results
+      debug:
+        msg:
+          - ""
+          - "=========================================="
+          - "Results: Instance Types With Capacity"
+          - "=========================================="
+          - "{% if available_with_capacity | length > 0 %}Found {{ available_with_capacity | length }} instance type(s) with available capacity:{% else %}No instance types with available capacity found!{% endif %}"
+
+    - name: Show available instance types with details
+      debug:
+        msg:
+          - "{{ loop.index }}. {{ item[0] }}"
+          - "   vCPUs: {{ item[1] }}, Memory: {{ (item[2] / 1024) | round(1) }} GiB"
+      loop: "{{ suitable_types | selectattr('0', 'in', available_with_capacity) | list }}"
+      loop_control:
+        index_var: loop_index
+        label: "{{ item[0] }}"
+      when: available_with_capacity | length > 0
+      vars:
+        loop:
+          index: "{{ loop_index + 1 }}"
+
+    - name: Save detailed results
+      copy:
+        content: |
+          # Instance Type Availability Report
+          # Generated: {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}
+          # Region: {{ aws_region }}
+          # Availability Zone: {{ availability_zone }}
+          # Current Instance: {{ current_instance_type }} ({{ current_vcpus }} vCPUs, {{ (current_memory_mib / 1024) | round(1) }} GiB)
+
+          ## Instance Types WITH Available Capacity
+
+          {% for type_name in available_with_capacity %}
+          {% set type_details = suitable_types | selectattr('0', 'equalto', type_name) | first %}
+          - {{ type_details[0] }}: {{ type_details[1] }} vCPUs, {{ (type_details[2] / 1024) | round(1) }} GiB, {{ type_details[3] }}
+          {% endfor %}
+
+          ## Instance Types WITHOUT Capacity (Tested)
+
+          {% for type in unavailable_capacity %}
+          - {{ type }}
+          {% endfor %}
+
+          ## All Suitable Types ({{ suitable_types | length }} total)
+
+          {% for type in suitable_types %}
+          - {{ type[0] }}: {{ type[1] }} vCPUs, {{ (type[2] / 1024) | round(1) }} GiB, {{ type[3] }}
+          {% endfor %}
+
+          ## Recommendation
+
+          {% if available_with_capacity | length > 0 %}
+          Best option: {{ available_with_capacity[0] }}
+
+          To switch to this instance type:
+          1. Stop the instance: ansible-playbook stop-instance.yml
+          2. Modify instance type: ansible-playbook modify-instance-type.yml --extra-vars "new_instance_type={{ available_with_capacity[0] }}"
+          3. Start the instance: ansible-playbook start-instance.yml
+          {% else %}
+          No instances with available capacity at this time.
+          - Capacity changes frequently - try running this playbook again in a few minutes
+          - Consider trying a different availability zone
+          - Consider reducing the min vCPU/memory requirements
+          {% endif %}
+        dest: "./instance-capacity-report.txt"
+
+    - name: Display summary and next steps
+      debug:
+        msg:
+          - ""
+          - "=========================================="
+          - "Summary"
+          - "=========================================="
+          - "Suitable types found: {{ suitable_types | length }}"
+          - "Types tested: {{ types_to_test | length }}"
+          - "Types with capacity: {{ available_with_capacity | length }}"
+          - ""
+          - "{% if available_with_capacity | length > 0 %}✓ RECOMMENDED: {{ available_with_capacity[0] }}"
+          - ""
+          - "To use this instance type:"
+          - "  1. ansible-playbook stop-instance.yml"
+          - "  2. ansible-playbook modify-instance-type.yml --extra-vars \"new_instance_type={{ available_with_capacity[0] }}\""
+          - "  3. ansible-playbook start-instance.yml{% else %}✗ No capacity available for tested instance types"
+          - "   Try again later or test more instance types{% endif %}"
+          - ""
+          - "Full report saved to: ./instance-capacity-report.txt"

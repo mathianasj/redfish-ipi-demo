@@ -1,0 +1,592 @@
+---
+- name: Read pull secret from local file
+  ansible.builtin.slurp:
+    src: "{{ playbook_dir }}/pullsecret.json"
+  register: pull_secret_content
+  delegate_to: localhost
+
+- name: Read SSH public key from local file
+  ansible.builtin.slurp:
+    src: ~/.ssh/id_rsa_fips.pub
+  register: ssh_public_key_content
+  delegate_to: localhost
+
+- name: Minify pull secret to single line
+  ansible.builtin.shell: |
+    python3 -c "import json, sys; print(json.dumps(json.loads(sys.stdin.read()), separators=(',', ':')))"
+  args:
+    stdin: "{{ pull_secret_content.content | b64decode }}"
+  register: pull_secret_minified
+  delegate_to: localhost
+  changed_when: false
+
+- name: Parse pull secret
+  set_fact:
+    pull_secret: "{{ pull_secret_minified.stdout }}"
+
+- name: Parse SSH public key
+  set_fact:
+    ssh_public_key: "{{ ssh_public_key_content.content | b64decode | trim }}"
+
+- name: Get EC2 instance private IP (for BMC and DNS)
+  set_fact:
+    ec2_instance_ip: "{{ ansible_default_ipv4.address }}"
+
+- name: Check if default libvirt network is active
+  ansible.builtin.shell: virsh net-list | grep -w default || echo ""
+  register: default_net_check
+  changed_when: false
+  become: true
+
+- name: Fail if default network is not active
+  fail:
+    msg: |
+      The 'default' libvirt network is not active.
+
+      This network should be created and started by playbook.yml during initial setup.
+
+      Please run: ansible-playbook playbook.yml
+
+      Or if you've already run it, start the network manually:
+        sudo virsh net-start default
+        sudo virsh net-autostart default
+  when: default_net_check.stdout == ""
+
+- name: Get virbr0 network gateway
+  ansible.builtin.shell: |
+    virsh net-dumpxml default | xmllint --xpath 'string(//network/ip/@address)' -
+  register: virbr0_gateway
+  changed_when: false
+  become: true
+
+- name: Get virbr0 netmask
+  ansible.builtin.shell: |
+    virsh net-dumpxml default | xmllint --xpath 'string(//network/ip/@netmask)' -
+  register: virbr0_netmask
+  changed_when: false
+  become: true
+
+- name: Get virbr0 DHCP range start
+  ansible.builtin.shell: |
+    virsh net-dumpxml default | xmllint --xpath 'string(//network/ip/dhcp/range/@start)' -
+  register: dhcp_start
+  changed_when: false
+  become: true
+
+- name: Get virbr0 DHCP range end
+  ansible.builtin.shell: |
+    virsh net-dumpxml default | xmllint --xpath 'string(//network/ip/dhcp/range/@end)' -
+  register: dhcp_end
+  changed_when: false
+  become: true
+
+- name: Convert netmask to CIDR prefix
+  ansible.builtin.shell: |
+    python3 -c "import ipaddress; print(ipaddress.IPv4Network('0.0.0.0/{{ virbr0_netmask.stdout }}').prefixlen)"
+  register: virbr0_prefix
+  changed_when: false
+
+- name: Calculate network CIDR
+  set_fact:
+    ocp_machine_network_cidr: "{{ virbr0_gateway.stdout | regex_replace('\\.[0-9]+$', '.0') }}/{{ virbr0_prefix.stdout }}"
+    ocp_machine_network_gateway: "{{ virbr0_gateway.stdout }}"
+
+- name: Get currently used IPs on virbr0 network
+  ansible.builtin.shell: |
+    set -o pipefail
+    virsh net-dhcp-leases default 2>/dev/null | awk 'NR>2 {print $5}' | cut -d'/' -f1 || echo ""
+  register: used_ips
+  changed_when: false
+  become: true
+
+- name: Get base network from gateway
+  set_fact:
+    network_base: "{{ virbr0_gateway.stdout | regex_replace('^(\\d+\\.\\d+\\.\\d+)\\.\\d+$', '\\1') }}"
+
+- name: Generate list of potential static IPs (outside DHCP range)
+  set_fact:
+    potential_static_ips: "{{ range(2, dhcp_start.stdout.split('.')[-1] | int) | map('string') | list }}"
+
+- name: Filter out used IPs and reserve 5 IPs for OpenShift
+  set_fact:
+    available_ips: "{{ potential_static_ips | difference(used_ips.stdout_lines | map('regex_replace', '^.*\\.(\\d+)$', '\\1') | list) | list }}"
+
+- name: Ensure we have at least 5 available IPs
+  fail:
+    msg: "Not enough available IPs in virbr0 network. Need 5, found {{ available_ips | length }}"
+  when: available_ips | length < 5
+
+- name: Assign IPs for OpenShift components
+  set_fact:
+    ocp_api_vip: "{{ network_base }}.{{ available_ips[0] }}"
+    ocp_ingress_vip: "{{ network_base }}.{{ available_ips[1] }}"
+    ocp_master1_ip: "{{ network_base }}.{{ available_ips[2] }}"
+    ocp_master2_ip: "{{ network_base }}.{{ available_ips[3] }}"
+    ocp_master3_ip: "{{ network_base }}.{{ available_ips[4] }}"
+
+- name: Generate random MAC addresses for master nodes
+  set_fact:
+    ocp_master1_mac: "52:54:00:{{ '%02x:%02x:%02x' | format(range(0, 256) | random, range(0, 256) | random, range(0, 256) | random) }}"
+    ocp_master2_mac: "52:54:00:{{ '%02x:%02x:%02x' | format(range(0, 256) | random, range(0, 256) | random, range(0, 256) | random) }}"
+    ocp_master3_mac: "52:54:00:{{ '%02x:%02x:%02x' | format(range(0, 256) | random, range(0, 256) | random, range(0, 256) | random) }}"
+
+- name: Set system IDs for master nodes
+  set_fact:
+    ocp_master1_system_id: "ocp-master-1"
+    ocp_master2_system_id: "ocp-master-2"
+    ocp_master3_system_id: "ocp-master-3"
+
+- name: Display OpenShift install configuration
+  debug:
+    msg:
+      - "=========================================="
+      - "OpenShift Install Configuration"
+      - "=========================================="
+      - ""
+      - "Cluster Details:"
+      - "  Cluster Name: {{ ocp_cluster_name }}"
+      - "  Base Domain: {{ ocp_base_domain }}"
+      - "  Machine Network: {{ ocp_machine_network_cidr }}"
+      - "  Gateway: {{ ocp_machine_network_gateway }}"
+      - ""
+      - "Virtual IPs:"
+      - "  API VIP: {{ ocp_api_vip }}"
+      - "  Ingress VIP: {{ ocp_ingress_vip }}"
+      - ""
+      - "Master Nodes:"
+      - "  Master-1: {{ ocp_master1_ip }} ({{ ocp_master1_mac }})"
+      - "  Master-2: {{ ocp_master2_ip }} ({{ ocp_master2_mac }})"
+      - "  Master-3: {{ ocp_master3_ip }} ({{ ocp_master3_mac }})"
+      - ""
+      - "Infrastructure:"
+      - "  EC2 Instance IP (BMC/DNS): {{ ec2_instance_ip }}"
+      - "  Redfish BMC: http://{{ ec2_instance_ip }}:8000/redfish/v1/"
+      - ""
+      - "=========================================="
+
+- name: Check if BIND DNS is configured
+  ansible.builtin.stat:
+    path: /var/named/{{ ocp_base_domain }}.zone
+  register: dns_zone_file
+  become: true
+
+- name: Configure DNS for OpenShift cluster
+  block:
+    - name: Update forward zone file with OpenShift records
+      ansible.builtin.copy:
+        content: |
+          $TTL 86400
+          @   IN  SOA     ns1.{{ ocp_base_domain }}. admin.{{ ocp_base_domain }}. (
+                          {{ ansible_date_time.epoch }}  ; Serial
+                          3600                            ; Refresh
+                          1800                            ; Retry
+                          604800                          ; Expire
+                          86400 )                         ; Minimum TTL
+
+          ; Name servers
+          @               IN  NS      ns1.{{ ocp_base_domain }}.
+
+          ; A records for name servers
+          ns1             IN  A       {{ ec2_instance_ip }}
+
+          ; OpenShift API endpoint
+          api.{{ ocp_cluster_name }}              IN  A       {{ ocp_api_vip }}
+
+          ; OpenShift Ingress (wildcard for apps)
+          *.apps.{{ ocp_cluster_name }}           IN  A       {{ ocp_ingress_vip }}
+        dest: /var/named/{{ ocp_base_domain }}.zone
+        mode: '0644'
+        owner: named
+        group: named
+      become: true
+
+    - name: Calculate reverse zone octets from API VIP
+      set_fact:
+        api_vip_last_octet: "{{ ocp_api_vip.split('.')[-1] }}"
+        ingress_vip_last_octet: "{{ ocp_ingress_vip.split('.')[-1] }}"
+
+    - name: Update reverse zone file with PTR records
+      ansible.builtin.copy:
+        content: |
+          $TTL 86400
+          @   IN  SOA     ns1.{{ ocp_base_domain }}. admin.{{ ocp_base_domain }}. (
+                          {{ ansible_date_time.epoch }}  ; Serial
+                          3600                            ; Refresh
+                          1800                            ; Retry
+                          604800                          ; Expire
+                          86400 )                         ; Minimum TTL
+
+          ; Name servers
+          @               IN  NS      ns1.{{ ocp_base_domain }}.
+
+          ; PTR records
+          {{ api_vip_last_octet }}              IN  PTR     api.{{ ocp_cluster_name }}.{{ ocp_base_domain }}.
+          {{ ingress_vip_last_octet }}          IN  PTR     apps.{{ ocp_cluster_name }}.{{ ocp_base_domain }}.
+        dest: /var/named/122.168.192.in-addr.arpa.zone
+        mode: '0644'
+        owner: named
+        group: named
+      become: true
+
+    - name: Set correct SELinux context for zone files
+      ansible.builtin.command: restorecon -rv /var/named
+      changed_when: false
+      become: true
+
+    - name: Reload named service to apply DNS changes
+      ansible.builtin.systemd:
+        name: named
+        state: reloaded
+      become: true
+
+    - name: Wait for DNS changes to propagate
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: Test DNS resolution for API endpoint
+      ansible.builtin.command: dig @localhost api.{{ ocp_cluster_name }}.{{ ocp_base_domain }} +short
+      register: api_dns_test
+      changed_when: false
+      failed_when: ocp_api_vip not in api_dns_test.stdout
+
+    - name: Test DNS resolution for Ingress wildcard
+      ansible.builtin.command: dig @localhost test.apps.{{ ocp_cluster_name }}.{{ ocp_base_domain }} +short
+      register: apps_dns_test
+      changed_when: false
+      failed_when: ocp_ingress_vip not in apps_dns_test.stdout
+
+    - name: Display DNS configuration success
+      debug:
+        msg:
+          - "✓ DNS records created successfully"
+          - "  api.{{ ocp_cluster_name }}.{{ ocp_base_domain }} → {{ ocp_api_vip }}"
+          - "  *.apps.{{ ocp_cluster_name }}.{{ ocp_base_domain }} → {{ ocp_ingress_vip }}"
+
+  when: dns_zone_file.stat.exists
+
+- name: Check if master VMs already exist
+  ansible.builtin.shell: |
+    virsh list --all --name | grep -E "^{{ ocp_master1_system_id }}$|^{{ ocp_master2_system_id }}$|^{{ ocp_master3_system_id }}$" || echo ""
+  register: existing_vms
+  changed_when: false
+  become: true
+
+- name: Display existing VMs
+  debug:
+    msg: "Found existing VMs: {{ existing_vms.stdout_lines }}"
+  when: existing_vms.stdout != ""
+
+- name: Create master-1 VM
+  ansible.builtin.shell: |
+    virt-install \
+      --name {{ ocp_master1_system_id }} \
+      --memory 32768 \
+      --vcpus 8 \
+      --cpu kvm64 \
+      --disk size=120,format=qcow2,bus=virtio \
+      --network bridge=virbr0,mac={{ ocp_master1_mac }} \
+      --boot uefi,network \
+      --graphics vnc \
+      --noautoconsole \
+      --os-variant rhel9.0 \
+      --events on_crash=restart \
+      --noreboot
+  when: ocp_master1_system_id not in existing_vms.stdout_lines
+  become: true
+  register: master1_create_result
+
+- name: Create master-2 VM
+  ansible.builtin.shell: |
+    virt-install \
+      --name {{ ocp_master2_system_id }} \
+      --memory 32768 \
+      --vcpus 8 \
+      --cpu kvm64 \
+      --disk size=120,format=qcow2,bus=virtio \
+      --network bridge=virbr0,mac={{ ocp_master2_mac }} \
+      --boot uefi,network \
+      --graphics vnc \
+      --noautoconsole \
+      --os-variant rhel9.0 \
+      --events on_crash=restart \
+      --noreboot
+  when: ocp_master2_system_id not in existing_vms.stdout_lines
+  become: true
+  register: master2_create_result
+
+- name: Create master-3 VM
+  ansible.builtin.shell: |
+    virt-install \
+      --name {{ ocp_master3_system_id }} \
+      --memory 32768 \
+      --vcpus 8 \
+      --cpu kvm64 \
+      --disk size=120,format=qcow2,bus=virtio \
+      --network bridge=virbr0,mac={{ ocp_master3_mac }} \
+      --boot uefi,network \
+      --graphics vnc \
+      --noautoconsole \
+      --os-variant rhel9.0 \
+      --events on_crash=restart \
+      --noreboot
+  when: ocp_master3_system_id not in existing_vms.stdout_lines
+  become: true
+  register: master3_create_result
+
+- name: Wait for VMs to be defined
+  ansible.builtin.pause:
+    seconds: 3
+
+- name: Fix master-1 CPU to disable VMX (prevent KVM errors)
+  ansible.builtin.shell: |
+    # Export current XML
+    virsh dumpxml {{ ocp_master1_system_id }} > /tmp/{{ ocp_master1_system_id }}-cpu-fix.xml
+
+    # Remove existing CPU section
+    sed -i '/<cpu.*>/,/<\/cpu>/d' /tmp/{{ ocp_master1_system_id }}-cpu-fix.xml
+
+    # Add Skylake-Server-IBRS with VMX disabled
+    sed -i 's|<clock|  <cpu mode="custom" match="exact" check="none">\n    <model fallback="allow">Skylake-Server-IBRS</model>\n    <feature policy="disable" name="vmx"/>\n  </cpu>\n  <clock|' /tmp/{{ ocp_master1_system_id }}-cpu-fix.xml
+
+    # Apply via virsh define
+    virsh define /tmp/{{ ocp_master1_system_id }}-cpu-fix.xml
+
+    # Clean up
+    rm -f /tmp/{{ ocp_master1_system_id }}-cpu-fix.xml
+  when: master1_create_result is changed
+  become: true
+
+- name: Fix master-2 CPU to disable VMX (prevent KVM errors)
+  ansible.builtin.shell: |
+    # Export current XML
+    virsh dumpxml {{ ocp_master2_system_id }} > /tmp/{{ ocp_master2_system_id }}-cpu-fix.xml
+
+    # Remove existing CPU section
+    sed -i '/<cpu.*>/,/<\/cpu>/d' /tmp/{{ ocp_master2_system_id }}-cpu-fix.xml
+
+    # Add Skylake-Server-IBRS with VMX disabled
+    sed -i 's|<clock|  <cpu mode="custom" match="exact" check="none">\n    <model fallback="allow">Skylake-Server-IBRS</model>\n    <feature policy="disable" name="vmx"/>\n  </cpu>\n  <clock|' /tmp/{{ ocp_master2_system_id }}-cpu-fix.xml
+
+    # Apply via virsh define
+    virsh define /tmp/{{ ocp_master2_system_id }}-cpu-fix.xml
+
+    # Clean up
+    rm -f /tmp/{{ ocp_master2_system_id }}-cpu-fix.xml
+  when: master2_create_result is changed
+  become: true
+
+- name: Fix master-3 CPU to disable VMX (prevent KVM errors)
+  ansible.builtin.shell: |
+    # Export current XML
+    virsh dumpxml {{ ocp_master3_system_id }} > /tmp/{{ ocp_master3_system_id }}-cpu-fix.xml
+
+    # Remove existing CPU section
+    sed -i '/<cpu.*>/,/<\/cpu>/d' /tmp/{{ ocp_master3_system_id }}-cpu-fix.xml
+
+    # Add Skylake-Server-IBRS with VMX disabled
+    sed -i 's|<clock|  <cpu mode="custom" match="exact" check="none">\n    <model fallback="allow">Skylake-Server-IBRS</model>\n    <feature policy="disable" name="vmx"/>\n  </cpu>\n  <clock|' /tmp/{{ ocp_master3_system_id }}-cpu-fix.xml
+
+    # Apply via virsh define
+    virsh define /tmp/{{ ocp_master3_system_id }}-cpu-fix.xml
+
+    # Clean up
+    rm -f /tmp/{{ ocp_master3_system_id }}-cpu-fix.xml
+  when: master3_create_result is changed
+  become: true
+
+- name: Wait for VM definitions to settle
+  ansible.builtin.pause:
+    seconds: 2
+
+- name: Verify VMs are created and get their UUIDs
+  ansible.builtin.shell: |
+    virsh list --all --name | grep -E "^{{ ocp_master1_system_id }}$|^{{ ocp_master2_system_id }}$|^{{ ocp_master3_system_id }}$"
+  register: created_vms
+  changed_when: false
+  become: true
+
+- name: Get master-1 UUID
+  ansible.builtin.shell: |
+    virsh domuuid {{ ocp_master1_system_id }}
+  register: master1_uuid
+  changed_when: false
+  become: true
+
+- name: Get master-2 UUID
+  ansible.builtin.shell: |
+    virsh domuuid {{ ocp_master2_system_id }}
+  register: master2_uuid
+  changed_when: false
+  become: true
+
+- name: Get master-3 UUID
+  ansible.builtin.shell: |
+    virsh domuuid {{ ocp_master3_system_id }}
+  register: master3_uuid
+  changed_when: false
+  become: true
+
+- name: Update system IDs with UUIDs for Redfish
+  set_fact:
+    ocp_master1_redfish_id: "{{ master1_uuid.stdout }}"
+    ocp_master2_redfish_id: "{{ master2_uuid.stdout }}"
+    ocp_master3_redfish_id: "{{ master3_uuid.stdout }}"
+
+- name: Display created VMs
+  debug:
+    msg:
+      - "✓ Created {{ created_vms.stdout_lines | length }} master node VMs:"
+      - "  - {{ ocp_master1_system_id }} (UUID: {{ ocp_master1_redfish_id }})"
+      - "  - {{ ocp_master2_system_id }} (UUID: {{ ocp_master2_redfish_id }})"
+      - "  - {{ ocp_master3_system_id }} (UUID: {{ ocp_master3_redfish_id }})"
+      - ""
+      - "VM Specifications:"
+      - "  - CPU: 8 vCPUs (Skylake-Server-IBRS with VMX disabled)"
+      - "  - Memory: 32 GB"
+      - "  - Disk: 120 GB (virtio)"
+      - "  - Boot: UEFI + Network"
+      - "  - Events: Auto-restart on crash"
+      - ""
+      - "CPU Configuration: VMX disabled at both hypervisor and VM level to prevent KVM errors"
+      - ""
+      - "VMs are defined but not running (OpenShift installer will boot them via Redfish)"
+
+- name: Create OpenShift installation directory
+  ansible.builtin.file:
+    path: /home/ec2-user/openshift-install
+    state: directory
+    owner: ec2-user
+    group: ec2-user
+    mode: '0755'
+
+- name: Template install-config.yaml
+  ansible.builtin.template:
+    src: install-config.yaml.j2
+    dest: /home/ec2-user/openshift-install/install-config.yaml
+    owner: ec2-user
+    group: ec2-user
+    mode: '0644'
+
+- name: Create backup copy of install-config.yaml in ec2-user home directory
+  ansible.builtin.copy:
+    src: /home/ec2-user/openshift-install/install-config.yaml
+    dest: /home/ec2-user/install-config.yaml.backup
+    owner: ec2-user
+    group: ec2-user
+    mode: '0644'
+    remote_src: true
+
+- name: Validate install-config.yaml syntax
+  ansible.builtin.shell: |
+    python3 -c "import yaml; yaml.safe_load(open('/home/ec2-user/openshift-install/install-config.yaml'))"
+  register: yaml_validation
+  changed_when: false
+  failed_when: false
+
+- name: Display validation result
+  debug:
+    msg: "✓ install-config.yaml is valid YAML"
+  when: yaml_validation.rc == 0
+
+- name: Fail if YAML is invalid
+  fail:
+    msg: |
+      ✗ install-config.yaml has invalid YAML syntax!
+
+      Error:
+      {{ yaml_validation.stderr }}
+
+      Please check the template at: roles/openshift_install/templates/install-config.yaml.j2
+  when: yaml_validation.rc != 0
+
+- name: Display generated install-config.yaml for review
+  ansible.builtin.slurp:
+    src: /home/ec2-user/openshift-install/install-config.yaml
+  register: install_config_content
+
+- name: Show install-config.yaml content
+  debug:
+    msg: "{{ install_config_content.content | b64decode | split('\n') }}"
+
+- name: Save IP and MAC address mapping for reference
+  ansible.builtin.copy:
+    content: |
+      # OpenShift Cluster Network Configuration
+      # Generated: {{ ansible_date_time.iso8601 }}
+
+      Cluster: {{ ocp_cluster_name }}.{{ ocp_base_domain }}
+      Network: {{ ocp_machine_network_cidr }}
+      Gateway: {{ ocp_machine_network_gateway }}
+
+      API VIP: {{ ocp_api_vip }}
+      Ingress VIP: {{ ocp_ingress_vip }}
+
+      Master Nodes (VMs created and ready):
+      - Name: master-1
+        Domain: {{ ocp_master1_system_id }}
+        UUID: {{ ocp_master1_redfish_id }}
+        IP: {{ ocp_master1_ip }}
+        MAC: {{ ocp_master1_mac }}
+        Specs: 8 vCPUs, 32 GB RAM, 120 GB Disk
+        BMC: redfish-virtualmedia://{{ ec2_instance_ip }}:8000/redfish/v1/Systems/{{ ocp_master1_redfish_id }}
+
+      - Name: master-2
+        Domain: {{ ocp_master2_system_id }}
+        UUID: {{ ocp_master2_redfish_id }}
+        IP: {{ ocp_master2_ip }}
+        MAC: {{ ocp_master2_mac }}
+        Specs: 8 vCPUs, 32 GB RAM, 120 GB Disk
+        BMC: redfish-virtualmedia://{{ ec2_instance_ip }}:8000/redfish/v1/Systems/{{ ocp_master2_redfish_id }}
+
+      - Name: master-3
+        Domain: {{ ocp_master3_system_id }}
+        UUID: {{ ocp_master3_redfish_id }}
+        IP: {{ ocp_master3_ip }}
+        MAC: {{ ocp_master3_mac }}
+        Specs: 8 vCPUs, 32 GB RAM, 120 GB Disk
+        BMC: redfish-virtualmedia://{{ ec2_instance_ip }}:8000/redfish/v1/Systems/{{ ocp_master3_redfish_id }}
+
+      NOTE: VMs are created and ready. The OpenShift installer will boot them
+      via Redfish virtual media using the UUIDs above.
+
+      To verify VMs: virsh list --all
+      To check Redfish: curl http://{{ ec2_instance_ip }}:8000/redfish/v1/Systems
+    dest: /home/ec2-user/openshift-install/network-config.txt
+    owner: ec2-user
+    group: ec2-user
+    mode: '0644'
+
+- name: Display success message
+  debug:
+    msg:
+      - "=========================================="
+      - "✓ OpenShift Environment Ready"
+      - "=========================================="
+      - ""
+      - "VMs Created:"
+      - "  ✓ {{ ocp_master1_system_id }} - 8 vCPUs, 32GB RAM, 120GB disk"
+      - "  ✓ {{ ocp_master2_system_id }} - 8 vCPUs, 32GB RAM, 120GB disk"
+      - "  ✓ {{ ocp_master3_system_id }} - 8 vCPUs, 32GB RAM, 120GB disk"
+      - ""
+      - "Configuration Files:"
+      - "  ✓ /home/ec2-user/openshift-install/install-config.yaml"
+      - "  ✓ /home/ec2-user/install-config.yaml.backup"
+      - "  ✓ /home/ec2-user/openshift-install/network-config.txt"
+      - ""
+      - "Network Configuration:"
+      - "  API VIP: {{ ocp_api_vip }}"
+      - "  Ingress VIP: {{ ocp_ingress_vip }}"
+      - "  DNS Server: {{ ec2_instance_ip }}"
+      - ""
+      - "Next Steps:"
+      - "  1. SSH to EC2 instance: ssh ec2-user@{{ ansible_host }}"
+      - "  2. Review config: cat ~/openshift-install/network-config.txt"
+      - "  3. Run installer: cd ~/openshift-install && openshift-install create cluster --log-level=info"
+      - ""
+      - "The installer will:"
+      - "  - Boot the VMs via Redfish virtual media"
+      - "  - Install RHCOS on each master node"
+      - "  - Bootstrap the OpenShift cluster"
+      - "  - Take approximately 45-60 minutes"
+      - ""
+      - "=========================================="

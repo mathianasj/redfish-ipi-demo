@@ -1,0 +1,90 @@
+apiVersion: v1alpha1
+kind: AgentConfig
+metadata:
+  name: ocp
+rendezvousIP: 192.168.122.10
+additionalNTPSources:
+  - 192.168.122.1  # Local NTP server (gateway)
+  - 0.rhel.pool.ntp.org
+  - 1.rhel.pool.ntp.org
+hosts:
+  - hostname: master-1
+    role: master
+    interfaces:
+      - name: eth0
+        macAddress: "52:54:00:aa:bb:01"
+    networkConfig:
+      interfaces:
+        - name: eth0
+          type: ethernet
+          state: up
+          mac-address: "52:54:00:aa:bb:01"
+          ipv4:
+            enabled: true
+            address:
+              - ip: 192.168.122.10
+                prefix-length: 24
+            dhcp: false
+      dns-resolver:
+        config:
+          server:
+            - 192.168.122.1
+      routes:
+        config:
+          - destination: 0.0.0.0/0
+            next-hop-address: 192.168.122.1
+            next-hop-interface: eth0
+
+  - hostname: master-2
+    role: master
+    interfaces:
+      - name: eth0
+        macAddress: "52:54:00:aa:bb:02"
+    networkConfig:
+      interfaces:
+        - name: eth0
+          type: ethernet
+          state: up
+          mac-address: "52:54:00:aa:bb:02"
+          ipv4:
+            enabled: true
+            address:
+              - ip: 192.168.122.11
+                prefix-length: 24
+            dhcp: false
+      dns-resolver:
+        config:
+          server:
+            - 192.168.122.1
+      routes:
+        config:
+          - destination: 0.0.0.0/0
+            next-hop-address: 192.168.122.1
+            next-hop-interface: eth0
+
+  - hostname: master-3
+    role: master
+    interfaces:
+      - name: eth0
+        macAddress: "52:54:00:aa:bb:03"
+    networkConfig:
+      interfaces:
+        - name: eth0
+          type: ethernet
+          state: up
+          mac-address: "52:54:00:aa:bb:03"
+          ipv4:
+            enabled: true
+            address:
+              - ip: 192.168.122.12
+                prefix-length: 24
+            dhcp: false
+      dns-resolver:
+        config:
+          server:
+            - 192.168.122.1
+      routes:
+        config:
+          - destination: 0.0.0.0/0
+            next-hop-address: 192.168.122.1
+            next-hop-interface: eth0

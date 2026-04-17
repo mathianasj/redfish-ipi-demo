@@ -1,0 +1,77 @@
+#!/usr/bin/expect -f
+
+set timeout 120
+set vm_name "{{ vyos_vm_name }}"
+set user "{{ vyos_user }}"
+set pass "{{ vyos_pass }}"
+set root_pass "{{ vyos_root_pass }}"
+
+log_user 1
+
+spawn virsh console $vm_name
+
+# Wake up console
+send "\r"
+sleep 2
+
+# Login
+expect "login:"
+send "$user\r"
+expect "Password:"
+send "$pass\r"
+expect "vyos@vyos"
+
+send_user "\n=== Starting installation ===\n"
+
+# Start install
+send "install image\r"
+
+# 1. Continue?
+expect -re "\\\[y/N\\\]"
+send "y\r"
+
+# 2. Image name (Default:)
+expect -re "Default:"
+send "\r"
+
+# 3. Password
+expect -re "password:"
+send "$root_pass\r"
+
+# 4. Confirm password
+expect -re "(Retype|Confirm)"
+send "$root_pass\r"
+
+# 5. Console selection (Default: S for Serial)
+expect -re "Default: S"
+send "S\r"
+
+# 6. Disk selection (Default: /dev/vda)
+expect -re "Default: /dev/vda"
+send "\r"
+
+# 7. Delete data confirmation
+expect -re "Continue.*\\\[y/N\\\]"
+send "y\r"
+
+# 8. Use all free space
+expect -re "free space.*\\\[Y/n\\\]"
+send "Y\r"
+
+# 9. Boot config file selection (Default: 1)
+expect -re "boot config.*Default:"
+send "\r"
+
+# 10. Wait for installation to complete (can take several minutes)
+set timeout 300
+expect "installed successfully"
+send_user "\n=== Installation complete ===\n"
+
+# Back at prompt
+expect "vyos@vyos"
+
+# Poweroff
+send "poweroff now\r"
+
+expect eof
+exit 0

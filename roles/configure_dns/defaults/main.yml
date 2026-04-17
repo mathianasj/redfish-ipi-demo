@@ -1,0 +1,8 @@
+---
+# DNS domain configuration
+dns_domain: example.com
+
+# DNS forwarders
+dns_forwarders:
+  - 8.8.8.8
+  - 8.8.4.4

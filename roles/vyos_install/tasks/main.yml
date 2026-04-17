@@ -1,0 +1,297 @@
+---
+- name: Ensure expect is installed
+  ansible.builtin.package:
+    name: expect
+    state: present
+
+- name: Get virbr0 network gateway
+  ansible.builtin.shell: |
+    virsh net-dumpxml default | xmllint --xpath 'string(//network/ip/@address)' -
+  register: network_gateway
+  changed_when: false
+
+- name: Get virbr0 netmask
+  ansible.builtin.shell: |
+    virsh net-dumpxml default | xmllint --xpath 'string(//network/ip/@netmask)' -
+  register: network_netmask
+  changed_when: false
+
+- name: Convert netmask to CIDR
+  ansible.builtin.shell: |
+    python3 -c "import ipaddress; print(ipaddress.IPv4Network('0.0.0.0/{{ network_netmask.stdout }}').prefixlen)"
+  register: network_cidr
+  changed_when: false
+
+- name: Get DHCP range start
+  ansible.builtin.shell: |
+    virsh net-dumpxml default | xmllint --xpath 'string(//network/ip/dhcp/range/@start)' -
+  register: dhcp_start
+  changed_when: false
+
+- name: Get currently used IPs
+  ansible.builtin.shell: |
+    virsh net-dhcp-leases default 2>/dev/null | awk 'NR>2 {print $5}' | cut -d'/' -f1 || echo ""
+  register: used_ips
+  changed_when: false
+
+- name: Calculate network base
+  set_fact:
+    network_base: "{{ network_gateway.stdout | regex_replace('^(\\d+\\.\\d+\\.\\d+)\\.\\d+$', '\\1') }}"
+
+- name: Find available static IP for VyOS
+  ansible.builtin.shell: |
+    DHCP_START={{ dhcp_start.stdout.split('.')[-1] }}
+    USED_IPS="{{ used_ips.stdout_lines | join(' ') }}"
+
+    for i in $(seq 10 $((DHCP_START - 1))); do
+      IP="{{ network_base }}.$i"
+      if ! echo "$USED_IPS" | grep -q "$IP"; then
+        echo "$IP"
+        exit 0
+      fi
+    done
+    echo "{{ network_base }}.10"
+  register: vyos_static_ip_result
+  changed_when: false
+
+- name: Set VyOS network facts
+  set_fact:
+    vyos_ip_address: "{{ vyos_static_ip_result.stdout }}"
+    vyos_gateway_ip: "{{ network_gateway.stdout }}"
+    vyos_cidr_prefix: "{{ network_cidr.stdout }}"
+    vyos_dns_server: "{{ network_gateway.stdout }}"
+
+- name: Display VyOS network configuration
+  debug:
+    msg:
+      - "VyOS Network Configuration:"
+      - "  IP Address: {{ vyos_ip_address }}/{{ vyos_cidr_prefix }}"
+      - "  Gateway: {{ vyos_gateway_ip }}"
+      - "  DNS: {{ vyos_dns_server }}"
+
+- name: Check if ISO exists
+  ansible.builtin.stat:
+    path: "{{ vyos_iso_path }}"
+  register: iso_stat
+
+- name: Verify ISO exists
+  assert:
+    that: iso_stat.stat.exists
+    fail_msg: "VyOS ISO not found at {{ vyos_iso_path }}"
+
+- name: Create VM disk
+  ansible.builtin.command:
+    cmd: qemu-img create -f qcow2 {{ vyos_disk_path }} {{ vyos_vm_disk_size }}G
+  args:
+    creates: "{{ vyos_disk_path }}"
+
+- name: Create VyOS VM
+  ansible.builtin.command: |
+    virt-install \
+      --name {{ vyos_vm_name }} \
+      --memory {{ vyos_vm_memory }} \
+      --vcpus {{ vyos_vm_vcpus }} \
+      --disk {{ vyos_disk_path }},format=qcow2,bus=virtio \
+      --cdrom {{ vyos_iso_path }} \
+      --network bridge={{ vyos_vm_bridge }},mac={{ vyos_vm_mac }},model=virtio \
+      --graphics none \
+      --console pty,target_type=serial \
+      --os-variant generic \
+      --boot cdrom,hd \
+      --noautoconsole
+
+- name: Wait for VyOS to boot from ISO
+  pause:
+    seconds: "{{ vyos_boot_wait }}"
+    prompt: "Waiting for VyOS live system to boot from ISO"
+
+- name: Check VM is running
+  ansible.builtin.shell: virsh domstate {{ vyos_vm_name }}
+  register: vm_state
+  changed_when: false
+
+- name: Display VM state
+  debug:
+    msg: "VM {{ vyos_vm_name }} is {{ vm_state.stdout }}"
+
+- name: Create VyOS installation expect script from template
+  ansible.builtin.template:
+    src: vyos-install.exp.j2
+    dest: "/tmp/vyos-install.exp"
+    mode: '0755'
+
+- name: Run VyOS installation via console
+  ansible.builtin.shell: /tmp/vyos-install.exp 2>&1 | tee /tmp/vyos-install.log
+  register: install_result
+  failed_when: false
+  async: 600
+  poll: 0
+
+- name: Wait for installation to complete
+  ansible.builtin.async_status:
+    jid: "{{ install_result.ansible_job_id }}"
+  register: job_result
+  until: job_result.finished
+  retries: 60
+  delay: 10
+
+- name: Display installation output
+  debug:
+    msg: "{{ job_result.stdout_lines | default(['No output']) }}"
+
+- name: Wait for VM to shutdown
+  pause:
+    seconds: 10
+
+- name: Force stop VM if still running
+  ansible.builtin.command: virsh destroy {{ vyos_vm_name }}
+  ignore_errors: true
+
+- name: Remove ISO from VM
+  ansible.builtin.shell: |
+    virt-xml {{ vyos_vm_name }} --edit target=hda --disk path=
+  ignore_errors: true
+
+- name: Set boot order to disk first
+  ansible.builtin.shell: |
+    virt-xml {{ vyos_vm_name }} --edit --boot hd,cdrom
+  ignore_errors: true
+
+- name: Start VyOS from installed disk
+  ansible.builtin.command: virsh start {{ vyos_vm_name }}
+
+- name: Wait for VyOS to boot from disk
+  pause:
+    seconds: 40
+
+- name: Configure VyOS network via console
+  ansible.builtin.shell: |
+    expect << 'EXPECT_EOF'
+    set timeout 60
+    log_user 1
+
+    spawn virsh console {{ vyos_vm_name }}
+
+    # Wake up console
+    send "\r"
+    sleep 2
+    send "\r"
+
+    # Login
+    expect {
+        timeout { send_user "\nTimeout waiting for login\n"; exit 1 }
+        "login:" {
+            send "{{ vyos_user }}\r"
+        }
+    }
+
+    expect "Password:"
+    send "{{ vyos_root_pass }}\r"
+    expect "vyos@vyos"
+
+    send_user "\n=== Configuring network ===\n"
+
+    # Enter configuration mode
+    send "configure\r"
+    expect "vyos@vyos#"
+
+    # Set interface address
+    send "set interfaces ethernet eth0 address {{ vyos_ip_address }}/{{ vyos_cidr_prefix }}\r"
+    expect "vyos@vyos#"
+
+    # Set default gateway
+    send "set protocols static route 0.0.0.0/0 next-hop {{ vyos_gateway_ip }}\r"
+    expect "vyos@vyos#"
+
+    # Set DNS
+    send "set system name-server {{ vyos_dns_server }}\r"
+    expect "vyos@vyos#"
+
+    # Set hostname
+    send "set system host-name {{ vyos_vm_name }}\r"
+    expect "vyos@vyos#"
+
+    # Enable SSH service
+    send "set service ssh\r"
+    expect "vyos@vyos#"
+
+    # Commit configuration
+    send "commit\r"
+    expect "vyos@vyos#"
+
+    # Save configuration
+    send "save\r"
+    expect {
+        "Saving configuration" { exp_continue }
+        "Done" { }
+    }
+    expect "vyos@vyos#"
+
+    send_user "\n=== Network configured ===\n"
+
+    # Exit
+    send "exit\r"
+    expect "vyos@vyos"
+
+    # Disconnect from console
+    send "\x1d"
+
+    exit 0
+    EXPECT_EOF
+  register: network_config_result
+  changed_when: network_config_result.rc == 0
+
+- name: Display network configuration result
+  debug:
+    msg: "{{ network_config_result.stdout_lines | default(['Configuration complete']) }}"
+
+- name: Wait for network to be active
+  pause:
+    seconds: 5
+
+- name: Get VM state
+  ansible.builtin.shell: virsh domstate {{ vyos_vm_name }}
+  register: final_state
+  changed_when: false
+
+- name: Verify VyOS IP address
+  ansible.builtin.shell: |
+    ping -c 1 -W 2 {{ vyos_ip_address }} >/dev/null 2>&1 && echo "{{ vyos_ip_address }}" || echo "Not reachable"
+  register: vyos_ip_check
+  changed_when: false
+
+- name: Set final IP fact
+  set_fact:
+    vyos_ip: "{{ vyos_ip_check.stdout }}"
+
+- name: Test SSH connectivity
+  ansible.builtin.shell: |
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+      {{ vyos_user }}@{{ vyos_ip_address }} 'show version | head -1' 2>/dev/null || echo "SSH not ready yet"
+  register: ssh_test
+  changed_when: false
+  failed_when: false
+
+- name: Display final status
+  debug:
+    msg:
+      - "=========================================="
+      - "VyOS Installation Complete"
+      - "=========================================="
+      - ""
+      - "VM Name: {{ vyos_vm_name }}"
+      - "State: {{ final_state.stdout }}"
+      - "IP Address: {{ vyos_ip_address }}/{{ vyos_cidr_prefix }}"
+      - "Gateway: {{ vyos_gateway_ip }}"
+      - "DNS: {{ vyos_dns_server }}"
+      - "Ping: {{ 'OK' if vyos_ip == vyos_ip_address else 'Not reachable' }}"
+      - "SSH: {{ 'Ready' if ssh_test.rc == 0 else 'Starting (try in 30 seconds)' }}"
+      - ""
+      - "Login: vyos / {{ vyos_root_pass }}"
+      - ""
+      - "Access:"
+      - "  SSH: ssh vyos@{{ vyos_ip_address }}"
+      - "  Console: sudo virsh console {{ vyos_vm_name }}"
+      - ""
+      - "Installation log: /tmp/vyos-install.log"
+      - "=========================================="

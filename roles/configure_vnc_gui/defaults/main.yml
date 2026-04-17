@@ -1,0 +1,23 @@
+---
+# VNC configuration (runs on localhost only, accessed via noVNC)
+vnc_password: redhat123  # Change this for production
+vnc_port: 5999  # VNC display :99 (localhost only, avoids conflict with libvirt VMs on 5900-5910)
+vnc_user: ec2-user
+vnc_display: 99
+
+# noVNC configuration
+novnc_http_port: 6080  # HTTP access port
+novnc_https_port: 6081  # HTTPS access port
+novnc_install_dir: /opt/novnc
+novnc_ssl_cert_dir: /etc/novnc/ssl
+
+# Desktop environment to install
+# Options: gnome (RHEL native)
+desktop_environment: gnome
+
+# AWS Security Group configuration
+aws_region: us-east-2
+instance_name: nested-virt-host
+
+# Firewall configuration
+vnc_firewall_zone: public

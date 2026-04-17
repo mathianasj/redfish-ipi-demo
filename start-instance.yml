@@ -1,0 +1,94 @@
+---
+- name: Start EC2 instance with retry on insufficient capacity
+  hosts: localhost
+  gather_facts: false
+  vars:
+    aws_region: us-east-2
+    instance_name: nested-virt-host
+    max_retries: 10
+    initial_delay: 5  # Initial delay in seconds
+    max_delay: 300    # Maximum delay in seconds (5 minutes)
+    backoff_multiplier: 1.5  # Multiplier for exponential backoff
+
+  tasks:
+    - name: Find EC2 instance by name tag
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+      register: instance_info
+
+    - name: Fail if instance not found
+      fail:
+        msg: "No instance found with Name tag: {{ instance_name }}"
+      when: instance_info.instances | length == 0
+
+    - name: Set instance ID
+      set_fact:
+        instance_id: "{{ instance_info.instances[0].instance_id }}"
+        instance_state: "{{ instance_info.instances[0].state.name }}"
+
+    - name: Display current instance state
+      debug:
+        msg:
+          - "Instance ID: {{ instance_id }}"
+          - "Current state: {{ instance_state }}"
+
+    - name: Check if instance is already running
+      debug:
+        msg: "Instance is already running, no action needed"
+      when: instance_state == "running"
+
+    - name: Start instance with retry logic
+      block:
+        - name: Initialize retry tracking
+          set_fact:
+            current_delay: "{{ initial_delay }}"
+            start_successful: false
+
+        - name: Attempt to start instance with exponential backoff
+          include_tasks: start_with_backoff.yml
+          loop: "{{ range(0, max_retries) | list }}"
+          loop_control:
+            loop_var: retry_attempt
+          when: not (start_successful | bool)
+
+        - name: Fail if all retries exhausted
+          fail:
+            msg: "Failed to start instance after {{ max_retries }} attempts. Last error: {{ last_error | default('Unknown error') }}"
+          when: not (start_successful | bool)
+
+      when: instance_state in ["stopped", "stopping"]
+
+    - name: Wait for instance to be fully ready
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        instance_ids:
+          - "{{ instance_id }}"
+      register: final_instance_info
+      retries: 20
+      delay: 5
+      until:
+        - final_instance_info.instances | length > 0
+        - final_instance_info.instances[0].state.name == "running"
+      when: instance_state in ["stopped", "stopping"]
+
+    - name: Get final instance details
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        instance_ids:
+          - "{{ instance_id }}"
+      register: final_info
+
+    - name: Display final instance information
+      debug:
+        msg:
+          - "=========================================="
+          - "Instance Status"
+          - "=========================================="
+          - "Instance ID: {{ instance_id }}"
+          - "State: {{ final_info.instances[0].state.name }}"
+          - "Public IP: {{ final_info.instances[0].public_ip_address | default('N/A') }}"
+          - "Instance Type: {{ final_info.instances[0].instance_type }}"
+          - "Availability Zone: {{ final_info.instances[0].placement.availability_zone }}"
+          - "=========================================="

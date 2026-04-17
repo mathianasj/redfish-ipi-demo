@@ -1,0 +1,28 @@
+---
+# VyOS VM configuration
+vyos_vm_name: "vyos-router"
+vyos_vm_memory: 2048
+vyos_vm_vcpus: 2
+vyos_vm_disk_size: 20
+vyos_vm_mac: "52:54:00:6b:3c:58"
+vyos_vm_bridge: "virbr0"
+
+# VyOS version and ISO path
+vyos_version: "2026.04.13-0034-rolling"
+vyos_iso_path: "/var/lib/libvirt/images/vyos-{{ vyos_version }}.iso"
+vyos_disk_path: "/var/lib/libvirt/images/{{ vyos_vm_name }}.qcow2"
+
+# VyOS credentials
+vyos_user: "vyos"
+vyos_pass: "vyos"
+vyos_root_pass: "vyos"
+
+# Boot wait time (seconds)
+vyos_boot_wait: 50
+
+# Network configuration (auto-discovered from virbr0/default network)
+# Override these if needed:
+# vyos_ip_address: "192.168.122.10"
+# vyos_gateway_ip: "192.168.122.1"
+# vyos_cidr_prefix: "24"
+# vyos_dns_server: "192.168.122.1"

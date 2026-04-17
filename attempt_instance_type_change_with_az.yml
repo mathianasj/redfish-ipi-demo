@@ -1,0 +1,336 @@
+---
+# Attempt to migrate to a specific instance type, potentially in a different AZ
+# migration_attempt structure: {type: type_array, az: zone, subnet: subnet_id}
+
+- name: Initialize variables
+  set_fact:
+    new_instance_id: ""
+    migration_ami_id: ""
+    storage_volume_id: ""
+    ocp_volume_id: ""
+
+- name: Display attempt
+  debug:
+    msg: "Attempting {{ migration_attempt.type[0] }} in {{ migration_attempt.az }}{% if migration_attempt.az != availability_zone %} (AZ MIGRATION){% endif %}: {{ migration_attempt.type[1] }} vCPUs (+{{ migration_attempt.type[4] | round(1) }}%), {{ (migration_attempt.type[2] / 1024) | round(1) }} GiB (+{{ migration_attempt.type[5] | round(1) }}%)"
+
+- name: Increment attempt counter
+  set_fact:
+    attempts_made: "{{ attempts_made | int + 1 }}"
+
+- name: Handle same AZ migration (simple instance type change)
+  block:
+    - name: Modify instance type
+      shell: |
+        aws ec2 modify-instance-attribute \
+          --region {{ aws_region }} \
+          --instance-id {{ instance_id }} \
+          --instance-type {{ migration_attempt.type[0] }}
+      register: modify_result
+      changed_when: false
+
+    - name: Wait for modification to apply
+      pause:
+        seconds: 3
+
+    - name: Attempt to start instance
+      amazon.aws.ec2_instance:
+        instance_ids:
+          - "{{ instance_id }}"
+        state: started
+        region: "{{ aws_region }}"
+        wait: false
+      register: start_attempt
+      ignore_errors: true
+
+  when: migration_attempt.az == availability_zone
+
+- name: Handle different AZ migration (AMI + new instance)
+  block:
+    - name: Create AMI from current instance
+      shell: |
+        aws ec2 create-image \
+          --region {{ aws_region }} \
+          --instance-id {{ instance_id }} \
+          --name "{{ instance_name }}-migration-{{ ansible_date_time.epoch }}" \
+          --description "Temporary AMI for AZ migration" \
+          --no-reboot \
+          --query 'ImageId' \
+          --output text
+      register: ami_create
+      changed_when: false
+
+    - name: Set AMI ID
+      set_fact:
+        migration_ami_id: "{{ ami_create.stdout }}"
+
+    - name: Wait for AMI to be available
+      shell: |
+        aws ec2 wait image-available \
+          --region {{ aws_region }} \
+          --image-ids {{ migration_ami_id }}
+      changed_when: false
+
+    - name: Get current instance security groups
+      set_fact:
+        security_group_ids: "{{ instance_info.instances[0].security_groups | map(attribute='group_id') | list }}"
+
+    - name: Launch new instance in target AZ
+      shell: |
+        aws ec2 run-instances \
+          --region {{ aws_region }} \
+          --image-id {{ migration_ami_id }} \
+          --instance-type {{ migration_attempt.type[0] }} \
+          --subnet-id {{ migration_attempt.subnet }} \
+          --security-group-ids {{ security_group_ids | join(' ') }} \
+          --key-name {{ instance_info.instances[0].key_name }} \
+          --cpu-options CoreCount={{ current_cpu_options.core_count }},ThreadsPerCore={{ current_cpu_options.threads_per_core }},NestedVirtualization=enabled \
+          --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value={{ instance_name }}-new}]' \
+          --query 'Instances[0].InstanceId' \
+          --output text
+      register: new_instance_create
+      ignore_errors: true
+
+    - name: Set new instance ID
+      set_fact:
+        new_instance_id: "{{ new_instance_create.stdout }}"
+      when: new_instance_create.rc == 0
+
+    - name: Wait for new instance to start
+      pause:
+        seconds: 10
+      when: new_instance_create.rc == 0
+
+  when: migration_attempt.az != availability_zone
+
+- name: Wait for instance state to settle
+  pause:
+    seconds: 5
+
+- name: Determine which instance to check
+  set_fact:
+    check_instance_id: "{{ new_instance_id if (migration_attempt.az != availability_zone and new_instance_id is defined) else instance_id }}"
+
+- name: Check instance state
+  amazon.aws.ec2_instance_info:
+    region: "{{ aws_region }}"
+    instance_ids:
+      - "{{ check_instance_id }}"
+  register: instance_check
+  retries: 3
+  delay: 2
+
+- name: Check for errors and state
+  set_fact:
+    capacity_error: "{{ instance_check.instances[0].state_reason is defined and 'InsufficientInstanceCapacity' in (instance_check.instances[0].state_reason.message | default('')) }}"
+    instance_running: "{{ instance_check.instances[0].state.name == 'running' }}"
+    instance_pending: "{{ instance_check.instances[0].state.name == 'pending' }}"
+
+- name: Wait for instance to reach running state if pending
+  amazon.aws.ec2_instance_info:
+    region: "{{ aws_region }}"
+    instance_ids:
+      - "{{ check_instance_id }}"
+  register: running_check
+  retries: 60
+  delay: 5
+  until: running_check.instances[0].state.name in ['running', 'stopped']
+  when: instance_pending
+
+- name: Update running status
+  set_fact:
+    instance_running: "{{ running_check.instances[0].state.name == 'running' }}"
+  when: instance_pending
+
+- name: Handle success
+  block:
+    - name: Handle AZ migration cleanup
+      block:
+        - name: Get old instance volumes
+          amazon.aws.ec2_instance_info:
+            region: "{{ aws_region }}"
+            instance_ids:
+              - "{{ instance_id }}"
+          register: old_instance_info
+
+        - name: Find storage volume
+          set_fact:
+            storage_volume_id: "{{ (old_instance_info.instances[0].block_device_mappings | selectattr('device_name', 'equalto', '/dev/sdf') | first).ebs.volume_id }}"
+            ocp_volume_id: "{{ (old_instance_info.instances[0].block_device_mappings | selectattr('device_name', 'equalto', '/dev/sdg') | first).ebs.volume_id }}"
+          ignore_errors: true
+
+        - name: Terminate old instance
+          amazon.aws.ec2_instance:
+            instance_ids:
+              - "{{ instance_id }}"
+            state: terminated
+            region: "{{ aws_region }}"
+            wait: false
+
+        - name: Wait for old instance to terminate
+          pause:
+            seconds: 30
+
+        - name: Remove old instance name tag
+          shell: |
+            aws ec2 create-tags \
+              --region {{ aws_region }} \
+              --resources {{ new_instance_id }} \
+              --tags Key=Name,Value={{ instance_name }}
+
+        - name: Detach storage volume from old instance if exists
+          shell: |
+            aws ec2 detach-volume \
+              --region {{ aws_region }} \
+              --volume-id {{ storage_volume_id }}
+          when: storage_volume_id is defined
+          ignore_errors: true
+
+        - name: Detach OCP volume from old instance if exists
+          shell: |
+            aws ec2 detach-volume \
+              --region {{ aws_region }} \
+              --volume-id {{ ocp_volume_id }}
+          when: ocp_volume_id is defined
+          ignore_errors: true
+
+        - name: Wait for volumes to detach
+          pause:
+            seconds: 10
+
+        - name: Attach storage volume to new instance
+          shell: |
+            aws ec2 attach-volume \
+              --region {{ aws_region }} \
+              --instance-id {{ new_instance_id }} \
+              --volume-id {{ storage_volume_id }} \
+              --device /dev/sdf
+          when: storage_volume_id is defined
+          ignore_errors: true
+
+        - name: Attach OCP volume to new instance
+          shell: |
+            aws ec2 attach-volume \
+              --region {{ aws_region }} \
+              --instance-id {{ new_instance_id }} \
+              --volume-id {{ ocp_volume_id }} \
+              --device /dev/sdg
+          when: ocp_volume_id is defined
+          ignore_errors: true
+
+        - name: Delete temporary AMI
+          shell: |
+            aws ec2 deregister-image \
+              --region {{ aws_region }} \
+              --image-id {{ migration_ami_id }}
+          ignore_errors: true
+
+        - name: Update instance_id to new instance
+          set_fact:
+            instance_id: "{{ new_instance_id }}"
+
+      when: migration_attempt.az != availability_zone
+
+    - name: Mark migration as successful
+      set_fact:
+        migration_successful: true
+        successful_type: "{{ migration_attempt.type[0] }}"
+        successful_az: "{{ migration_attempt.az }}"
+
+    - name: Get final instance info
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        instance_ids:
+          - "{{ check_instance_id }}"
+      register: final_info
+
+    - name: Display success details
+      debug:
+        msg:
+          - "✓ SUCCESS! Instance started with {{ migration_attempt.type[0] }} in {{ migration_attempt.az }}"
+          - "  vCPUs: {{ current_vcpus }} → {{ migration_attempt.type[1] }} (+{{ migration_attempt.type[4] | round(1) }}%)"
+          - "  Memory: {{ (current_memory_mib / 1024) | round(1) }} GiB → {{ (migration_attempt.type[2] / 1024) | round(1) }} GiB (+{{ migration_attempt.type[5] | round(1) }}%)"
+          - "{% if migration_attempt.az != availability_zone %}  AZ: {{ availability_zone }} → {{ migration_attempt.az }} (MIGRATED){% else %}  AZ: {{ migration_attempt.az }} (unchanged){% endif %}"
+          - "{% if migration_attempt.az != availability_zone %}  Old instance terminated, volumes reattached{% endif %}"
+          - "  Public IP: {{ final_info.instances[0].public_ip_address | default('N/A') }}"
+          - "  State: {{ final_info.instances[0].state.name }}"
+
+  when: instance_running
+
+- name: Handle capacity failure
+  block:
+    - name: Display capacity failure
+      debug:
+        msg: "✗ FAILED: {{ migration_attempt.type[0] }} in {{ migration_attempt.az }} - InsufficientInstanceCapacity"
+
+    - name: Cleanup failed AZ migration
+      block:
+        - name: Terminate failed new instance
+          amazon.aws.ec2_instance:
+            instance_ids:
+              - "{{ new_instance_id }}"
+            state: terminated
+            region: "{{ aws_region }}"
+            wait: false
+          ignore_errors: true
+          when: new_instance_id is defined
+
+        - name: Delete temporary AMI
+          shell: |
+            aws ec2 deregister-image \
+              --region {{ aws_region }} \
+              --image-id {{ migration_ami_id }}
+          ignore_errors: true
+          when: migration_ami_id is defined
+
+        - name: Display cleanup message
+          debug:
+            msg: "Cleaned up failed AZ migration attempt, original instance unchanged"
+
+      when: migration_attempt.az != availability_zone
+
+    - name: Cleanup failed same-AZ migration
+      block:
+        - name: Stop instance
+          amazon.aws.ec2_instance:
+            instance_ids:
+              - "{{ instance_id }}"
+            state: stopped
+            region: "{{ aws_region }}"
+            wait: true
+            wait_timeout: 300
+          ignore_errors: true
+
+        - name: Wait for stopped state
+          amazon.aws.ec2_instance_info:
+            region: "{{ aws_region }}"
+            instance_ids:
+              - "{{ instance_id }}"
+          register: stopped_check
+          retries: 30
+          delay: 5
+          until: stopped_check.instances[0].state.name == "stopped"
+
+        - name: Revert to original instance type
+          shell: |
+            aws ec2 modify-instance-attribute \
+              --region {{ aws_region }} \
+              --instance-id {{ instance_id }} \
+              --instance-type {{ current_instance_type }}
+          register: revert_result
+
+        - name: Wait after revert
+          pause:
+            seconds: 3
+
+        - name: Display revert confirmation
+          debug:
+            msg: "Reverted to {{ current_instance_type }}, trying next candidate..."
+
+      when: migration_attempt.az == availability_zone
+
+  when: not instance_running
+
+- name: Pause between attempts to avoid rate limiting
+  pause:
+    seconds: 2
+  when: not migration_successful

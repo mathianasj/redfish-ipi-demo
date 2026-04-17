@@ -1,0 +1,63 @@
+---
+# Query a batch of instance types and filter for nested virtualization support
+
+- name: Calculate batch end index
+  set_fact:
+    batch_end: "{{ [batch_start + 100, available_types_list | length] | min }}"
+
+- name: Get batch of instance types
+  set_fact:
+    current_batch: "{{ available_types_list[batch_start:batch_end] }}"
+
+- name: Display batch info
+  debug:
+    msg: "Querying batch {{ (batch_start / 100) | int + 1 }}: instances {{ batch_start + 1 }} to {{ batch_end }}"
+
+- name: Get all instance type details for this batch
+  shell: |
+    aws ec2 describe-instance-types \
+      --region {{ aws_region }} \
+      --instance-types {{ current_batch | join(' ') }} \
+      --output json
+  register: batch_result_full
+  changed_when: false
+  when: current_batch | length > 0
+
+- name: Filter for nested virtualization support and extract needed fields
+  shell: |
+    echo '{{ batch_result_full.stdout }}' | \
+    jq -r '.InstanceTypes[] |
+      select(
+        (.ProcessorInfo.SupportedFeatures // [] | contains(["nested-virtualization"]))) |
+      [.InstanceType,
+       .VCpuInfo.DefaultVCpus // 0,
+       .MemoryInfo.SizeInMiB // 0,
+       ((.ProcessorInfo.SupportedArchitectures // ["unknown"])[0])] |
+      @json'
+  register: batch_filtered
+  changed_when: false
+  when:
+    - current_batch | length > 0
+    - batch_result_full.stdout is defined
+
+- name: Parse filtered results into list
+  set_fact:
+    batch_types: "{{ batch_filtered.stdout_lines | map('from_json') | list }}"
+  when:
+    - batch_filtered.stdout_lines is defined
+    - batch_filtered.stdout_lines | length > 0
+
+- name: Handle empty batch results
+  set_fact:
+    batch_types: []
+  when:
+    - batch_filtered.stdout_lines is not defined or batch_filtered.stdout_lines | length == 0
+
+- name: Append batch results to candidate list
+  set_fact:
+    all_candidate_types: "{{ all_candidate_types + batch_types }}"
+  when: batch_types | length > 0
+
+- name: Display batch results
+  debug:
+    msg: "Batch {{ (batch_start / 100) | int + 1 }}: Found {{ batch_types | length }} instance types with nested virtualization support"

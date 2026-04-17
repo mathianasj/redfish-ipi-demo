@@ -1,0 +1,10 @@
+---
+- name: restart named
+  ansible.builtin.systemd:
+    name: named
+    state: restarted
+
+- name: reload firewalld
+  ansible.builtin.systemd:
+    name: firewalld
+    state: reloaded

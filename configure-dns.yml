@@ -1,0 +1,337 @@
+---
+- name: Find EC2 instance
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    aws_region: us-east-2
+    instance_name: nested-virt-host
+    ssh_private_key_path: "~/.ssh/id_rsa_fips"
+
+  tasks:
+    - name: Find EC2 instance by name
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+          "instance-state-name": ["running"]
+      register: instance_info
+
+    - name: Verify instance exists
+      fail:
+        msg: "No running EC2 instance found with name '{{ instance_name }}' in region {{ aws_region }}"
+      when: instance_info.instances | length == 0
+
+    - name: Add EC2 instance to inventory
+      add_host:
+        hostname: "{{ instance_info.instances[0].public_ip_address }}"
+        groupname: nested_virt_hosts
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: "{{ ssh_private_key_path }}"
+
+    - name: Display instance information
+      debug:
+        msg:
+          - "Found EC2 instance: {{ instance_name }}"
+          - "Public IP: {{ instance_info.instances[0].public_ip_address }}"
+          - "Instance ID: {{ instance_info.instances[0].instance_id }}"
+          - "Proceeding with DNS configuration..."
+
+- name: Configure DNS for OpenShift on example.com
+  hosts: nested_virt_hosts
+  become: true
+  gather_facts: true
+  vars:
+    dns_domain: example.com
+    cluster_name: sno
+    api_vip: 192.168.122.10
+    ingress_vip: 192.168.122.11
+    dns_forwarders:
+      - 8.8.8.8
+      - 8.8.4.4
+
+  tasks:
+    - name: Install BIND DNS server
+      ansible.builtin.dnf:
+        name:
+          - bind
+          - bind-utils
+        state: present
+
+    - name: Create BIND configuration directory
+      ansible.builtin.file:
+        path: /var/named
+        state: directory
+        mode: '0755'
+        owner: named
+        group: named
+
+    - name: Configure named.conf
+      ansible.builtin.copy:
+        content: |
+          options {
+              listen-on port 53 { any; };
+              listen-on-v6 port 53 { ::1; };
+              directory       "/var/named";
+              dump-file       "/var/named/data/cache_dump.db";
+              statistics-file "/var/named/data/named_stats.txt";
+              memstatistics-file "/var/named/data/named_mem_stats.txt";
+              secroots-file   "/var/named/data/named.secroots";
+              recursing-file  "/var/named/data/named.recursing";
+              allow-query     { any; };
+              allow-query-cache { any; };
+
+              recursion yes;
+
+              forwarders {
+                  {{ dns_forwarders[0] }};
+                  {{ dns_forwarders[1] }};
+              };
+
+              dnssec-validation no;
+
+              managed-keys-directory "/var/named/dynamic";
+              geoip-directory "/usr/share/GeoIP";
+
+              pid-file "/run/named/named.pid";
+              session-keyfile "/run/named/session.key";
+
+              /* https://fedoraproject.org/wiki/Changes/CryptoPolicy */
+              include "/etc/crypto-policies/back-ends/bind.config";
+          };
+
+          logging {
+              channel default_debug {
+                  file "data/named.run";
+                  severity dynamic;
+              };
+          };
+
+          zone "." IN {
+              type hint;
+              file "named.ca";
+          };
+
+          zone "{{ dns_domain }}" IN {
+              type master;
+              file "{{ dns_domain }}.zone";
+              allow-update { none; };
+          };
+
+          zone "122.168.192.in-addr.arpa" IN {
+              type master;
+              file "122.168.192.in-addr.arpa.zone";
+              allow-update { none; };
+          };
+
+          include "/etc/named.rfc1912.zones";
+          include "/etc/named.root.key";
+        dest: /etc/named.conf
+        mode: '0644'
+        owner: root
+        group: named
+      notify: restart named
+
+    - name: Create forward zone file for example.com
+      ansible.builtin.copy:
+        content: |
+          $TTL 86400
+          @   IN  SOA     ns1.{{ dns_domain }}. admin.{{ dns_domain }}. (
+                          {{ ansible_date_time.epoch }}  ; Serial
+                          3600                            ; Refresh
+                          1800                            ; Retry
+                          604800                          ; Expire
+                          86400 )                         ; Minimum TTL
+
+          ; Name servers
+          @               IN  NS      ns1.{{ dns_domain }}.
+
+          ; A records for name servers
+          ns1             IN  A       {{ ansible_default_ipv4.address }}
+
+          ; OpenShift API endpoint
+          api.{{ cluster_name }}              IN  A       {{ api_vip }}
+
+          ; OpenShift Ingress (wildcard for apps)
+          *.apps.{{ cluster_name }}           IN  A       {{ ingress_vip }}
+
+          ; Optional: Specific app records (uncomment if needed)
+          ; console-openshift-console.apps.{{ cluster_name }}    IN  A   {{ ingress_vip }}
+          ; oauth-openshift.apps.{{ cluster_name }}              IN  A   {{ ingress_vip }}
+        dest: /var/named/{{ dns_domain }}.zone
+        mode: '0644'
+        owner: named
+        group: named
+      notify: restart named
+
+    - name: Create reverse zone file
+      ansible.builtin.copy:
+        content: |
+          $TTL 86400
+          @   IN  SOA     ns1.{{ dns_domain }}. admin.{{ dns_domain }}. (
+                          {{ ansible_date_time.epoch }}  ; Serial
+                          3600                            ; Refresh
+                          1800                            ; Retry
+                          604800                          ; Expire
+                          86400 )                         ; Minimum TTL
+
+          ; Name servers
+          @               IN  NS      ns1.{{ dns_domain }}.
+
+          ; PTR records
+          10              IN  PTR     api.{{ cluster_name }}.{{ dns_domain }}.
+          11              IN  PTR     apps.{{ cluster_name }}.{{ dns_domain }}.
+        dest: /var/named/122.168.192.in-addr.arpa.zone
+        mode: '0644'
+        owner: named
+        group: named
+      notify: restart named
+
+    - name: Set correct SELinux context for zone files
+      ansible.builtin.command: restorecon -rv /var/named
+      changed_when: false
+
+    - name: Configure firewalld for DNS
+      ansible.posix.firewalld:
+        service: dns
+        permanent: yes
+        state: enabled
+        zone: public
+      notify: reload firewalld
+
+    - name: Start and enable named service
+      ansible.builtin.systemd:
+        name: named
+        state: started
+        enabled: true
+
+    - name: Check if baremetal bridge exists
+      ansible.builtin.shell: nmcli connection show | grep -w baremetal || echo ""
+      register: baremetal_exists
+      changed_when: false
+
+    - name: Get active network connection name
+      ansible.builtin.shell: |
+        if nmcli connection show baremetal >/dev/null 2>&1; then
+          echo "baremetal"
+        else
+          nmcli -t -f NAME,DEVICE connection show --active | grep -v '^lo:' | head -n1 | cut -d: -f1
+        fi
+      register: active_connection
+      changed_when: false
+
+    - name: Configure network connection to use localhost as DNS
+      ansible.builtin.command: |
+        nmcli connection modify "{{ active_connection.stdout }}" \
+          ipv4.dns "127.0.0.1" \
+          ipv4.ignore-auto-dns yes
+      when: active_connection.stdout != ""
+
+    - name: Reload network connection to apply DNS changes
+      ansible.builtin.command: nmcli connection up "{{ active_connection.stdout }}"
+      when: active_connection.stdout != ""
+
+    - name: Wait for DNS changes to apply
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: Verify resolv.conf uses localhost
+      ansible.builtin.shell: grep "nameserver 127.0.0.1" /etc/resolv.conf
+      register: resolv_check
+      changed_when: false
+      failed_when: false
+
+    - name: Display DNS resolver configuration
+      debug:
+        msg:
+          - "Active connection: {{ active_connection.stdout }}"
+          - "DNS configured to use localhost (127.0.0.1)"
+          - "Resolv.conf check: {{ 'OK' if resolv_check.rc == 0 else 'FAILED - may need manual check' }}"
+
+    - name: Test DNS configuration
+      ansible.builtin.command: named-checkconf /etc/named.conf
+      register: named_check
+      changed_when: false
+      failed_when: named_check.rc != 0
+
+    - name: Test forward zone file
+      ansible.builtin.command: named-checkzone {{ dns_domain }} /var/named/{{ dns_domain }}.zone
+      register: zone_check
+      changed_when: false
+      failed_when: zone_check.rc != 0
+
+    - name: Test reverse zone file
+      ansible.builtin.command: named-checkzone 122.168.192.in-addr.arpa /var/named/122.168.192.in-addr.arpa.zone
+      register: reverse_zone_check
+      changed_when: false
+      failed_when: reverse_zone_check.rc != 0
+
+    - name: Flush handlers to restart named service
+      meta: flush_handlers
+
+    - name: Wait for named service to be active
+      ansible.builtin.systemd:
+        name: named
+      register: named_status
+      until: named_status.status.ActiveState == "active"
+      retries: 10
+      delay: 2
+
+    - name: Wait for DNS service to be ready
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: Test DNS resolution for api.sno.example.com
+      ansible.builtin.command: dig @localhost api.{{ cluster_name }}.{{ dns_domain }} +short
+      register: api_dns_test
+      changed_when: false
+      failed_when: api_vip not in api_dns_test.stdout
+
+    - name: Test DNS resolution for *.apps.sno.example.com
+      ansible.builtin.command: dig @localhost test.apps.{{ cluster_name }}.{{ dns_domain }} +short
+      register: apps_dns_test
+      changed_when: false
+      failed_when: ingress_vip not in apps_dns_test.stdout
+
+    - name: Display DNS configuration summary
+      debug:
+        msg:
+          - "=========================================="
+          - "DNS Configuration Complete!"
+          - "=========================================="
+          - ""
+          - "DNS Server: {{ ansible_default_ipv4.address }}"
+          - "Domain: {{ dns_domain }}"
+          - "Cluster: {{ cluster_name }}"
+          - ""
+          - "EC2 Instance DNS Configuration:"
+          - "  This instance is configured to use itself (127.0.0.1) for DNS resolution"
+          - "  Active connection: {{ active_connection.stdout }}"
+          - "  Resolv.conf: {{ 'configured' if resolv_check.rc == 0 else 'check manually' }}"
+          - ""
+          - "DNS Records Created:"
+          - "  api.{{ cluster_name }}.{{ dns_domain }} → {{ api_vip }}"
+          - "  *.apps.{{ cluster_name }}.{{ dns_domain }} → {{ ingress_vip }}"
+          - ""
+          - "Test DNS from this instance:"
+          - "  dig api.{{ cluster_name }}.{{ dns_domain }}"
+          - "  dig console.apps.{{ cluster_name }}.{{ dns_domain }}"
+          - ""
+          - "Test DNS from your local machine:"
+          - "  dig @{{ ansible_default_ipv4.address }} api.{{ cluster_name }}.{{ dns_domain }}"
+          - "  dig @{{ ansible_default_ipv4.address }} console.apps.{{ cluster_name }}.{{ dns_domain }}"
+          - ""
+          - "VMs on the baremetal bridge will use {{ ansible_default_ipv4.address }} as DNS"
+          - "Configure in OpenShift networkConfig: dns-resolver: server: - {{ ansible_default_ipv4.address }}"
+          - "=========================================="
+
+  handlers:
+    - name: restart named
+      ansible.builtin.systemd:
+        name: named
+        state: restarted
+
+    - name: reload firewalld
+      ansible.builtin.systemd:
+        name: firewalld
+        state: reloaded

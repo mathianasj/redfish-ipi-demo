@@ -1,0 +1,176 @@
+---
+- name: Validate actual capacity for alternative instance types
+  hosts: localhost
+  gather_facts: false
+  vars:
+    aws_region: us-east-2
+    instance_name: nested-virt-host
+    # List of instance types to test (will be populated from find-alternative-instance-types.yml output)
+    # Or you can manually specify types to test
+    test_instance_types: []
+    max_types_to_test: 10  # Limit how many to test to avoid long run times
+
+  tasks:
+    - name: Find existing EC2 instance
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+      register: instance_info
+
+    - name: Fail if instance not found
+      fail:
+        msg: "No instance found with Name tag: {{ instance_name }}"
+      when: instance_info.instances | length == 0
+
+    - name: Set current instance facts
+      set_fact:
+        instance_id: "{{ instance_info.instances[0].instance_id }}"
+        current_instance_type: "{{ instance_info.instances[0].instance_type }}"
+        current_state: "{{ instance_info.instances[0].state.name }}"
+        availability_zone: "{{ instance_info.instances[0].placement.availability_zone }}"
+        subnet_id: "{{ instance_info.instances[0].subnet_id }}"
+        security_groups: "{{ instance_info.instances[0].security_groups }}"
+        ami_id: "{{ instance_info.instances[0].image_id }}"
+
+    - name: Display current instance info
+      debug:
+        msg:
+          - "Instance ID: {{ instance_id }}"
+          - "Current Type: {{ current_instance_type }}"
+          - "Current State: {{ current_state }}"
+          - "Availability Zone: {{ availability_zone }}"
+
+    - name: Check if alternative types file exists
+      stat:
+        path: "./alternative-instance-types.txt"
+      register: alt_file
+
+    - name: Read alternative instance types from file
+      shell: |
+        grep -E '^- [a-z0-9]+\.[a-z0-9]+:' alternative-instance-types.txt | \
+        head -n {{ max_types_to_test }} | \
+        awk '{print $2}' | \
+        cut -d: -f1
+      register: types_from_file
+      changed_when: false
+      when:
+        - alt_file.stat.exists
+        - test_instance_types | length == 0
+
+    - name: Set instance types to test from file
+      set_fact:
+        test_instance_types: "{{ types_from_file.stdout_lines }}"
+      when:
+        - alt_file.stat.exists
+        - test_instance_types | length == 0
+        - types_from_file.stdout_lines is defined
+
+    - name: Fail if no instance types to test
+      fail:
+        msg: |
+          No instance types to test! Either:
+          1. Run find-alternative-instance-types.yml first, or
+          2. Set test_instance_types variable manually
+      when: test_instance_types | length == 0
+
+    - name: Display instance types to be tested
+      debug:
+        msg:
+          - "Will test {{ test_instance_types | length }} instance types for actual capacity:"
+          - "{{ test_instance_types }}"
+
+    - name: Initialize results tracking
+      set_fact:
+        capacity_results: []
+        available_types: []
+        unavailable_types: []
+
+    - name: Test each instance type for capacity
+      include_tasks: test_instance_capacity.yml
+      loop: "{{ test_instance_types }}"
+      loop_control:
+        loop_var: test_type
+
+    - name: Display capacity test results
+      debug:
+        msg:
+          - "=========================================="
+          - "Capacity Validation Results"
+          - "=========================================="
+          - "Tested: {{ test_instance_types | length }} instance types"
+          - "Available: {{ available_types | length }}"
+          - "Unavailable: {{ unavailable_types | length }}"
+          - ""
+
+    - name: Display available instance types
+      debug:
+        msg:
+          - "Instance types WITH capacity:"
+          - "{{ available_types }}"
+      when: available_types | length > 0
+
+    - name: Display unavailable instance types
+      debug:
+        msg:
+          - "Instance types WITHOUT capacity (InsufficientInstanceCapacity):"
+          - "{{ unavailable_types }}"
+      when: unavailable_types | length > 0
+
+    - name: Save results to file
+      copy:
+        content: |
+          # Instance Type Capacity Validation Results
+          # Generated: {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}
+          # Region: {{ aws_region }}
+          # Availability Zone: {{ availability_zone }}
+          # Current Instance: {{ instance_id }} ({{ current_instance_type }})
+
+          ## Instance Types WITH Available Capacity ({{ available_types | length }})
+
+          {% for type in available_types %}
+          - {{ type }}
+          {% endfor %}
+
+          ## Instance Types WITHOUT Capacity ({{ unavailable_types | length }})
+
+          {% for type in unavailable_types %}
+          - {{ type }} (InsufficientInstanceCapacity)
+          {% endfor %}
+
+          ## Recommendation
+
+          {% if available_types | length > 0 %}
+          Use one of the available instance types above. Recommended:
+          1. {{ available_types[0] }}
+          {% if available_types | length > 1 %}
+          2. {{ available_types[1] }}
+          {% endif %}
+          {% if available_types | length > 2 %}
+          3. {{ available_types[2] }}
+          {% endif %}
+          {% else %}
+          No instance types with available capacity found at this time.
+          Consider:
+          - Trying again later (capacity changes frequently)
+          - Testing different availability zones
+          - Using a different region
+          {% endif %}
+        dest: "./capacity-validation-results.txt"
+
+    - name: Display results file location
+      debug:
+        msg: "Results saved to: ./capacity-validation-results.txt"
+
+    - name: Recommend next steps
+      debug:
+        msg:
+          - ""
+          - "=========================================="
+          - "Recommended Next Steps"
+          - "=========================================="
+          - "{% if available_types | length > 0 %}1. Update playbook.yml with: instance_type: {{ available_types[0] }}"
+          - "2. Stop the instance if running"
+          - "3. Modify the instance type"
+          - "4. Start the instance{% else %}No instances with capacity available right now."
+          - "Try again later or consider a different availability zone.{% endif %}"

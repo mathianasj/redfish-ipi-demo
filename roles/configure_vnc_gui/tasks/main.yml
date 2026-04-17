@@ -1,0 +1,698 @@
+---
+- name: Display VNC setup information
+  debug:
+    msg:
+      - "Setting up noVNC web-based GUI access on EC2 instance"
+      - "Desktop environment: GNOME"
+      - "HTTP port: {{ novnc_http_port }}"
+      - "HTTPS port: {{ novnc_https_port }}"
+      - "VNC user: {{ vnc_user }}"
+      - "VNC display: :{{ vnc_display }} (port {{ vnc_port }}, avoids libvirt VM ports)"
+
+- name: Install GNOME desktop environment
+  ansible.builtin.dnf:
+    name:
+      - "@Server with GUI"
+      - tigervnc-server
+      - firefox
+    state: present
+  become: true
+
+- name: Install noVNC and dependencies
+  ansible.builtin.dnf:
+    name:
+      - git
+      - python3
+      - python3-pip
+      - openssl
+      - numpy
+    state: present
+  become: true
+
+- name: Install websockify via pip
+  ansible.builtin.pip:
+    name: websockify
+    state: present
+  become: true
+
+- name: Clone noVNC repository
+  ansible.builtin.git:
+    repo: https://github.com/novnc/noVNC.git
+    dest: "{{ novnc_install_dir }}"
+    version: v1.4.0
+    force: true
+  become: true
+
+- name: Create VNC directory for user
+  ansible.builtin.file:
+    path: "/home/{{ vnc_user }}/.vnc"
+    state: directory
+    owner: "{{ vnc_user }}"
+    group: "{{ vnc_user }}"
+    mode: '0755'
+  become: true
+
+- name: Set VNC password for user
+  ansible.builtin.shell: |
+    echo "{{ vnc_password }}" | vncpasswd -f > /home/{{ vnc_user }}/.vnc/passwd
+  become: true
+  become_user: "{{ vnc_user }}"
+
+- name: Set VNC password file permissions
+  ansible.builtin.file:
+    path: "/home/{{ vnc_user }}/.vnc/passwd"
+    owner: "{{ vnc_user }}"
+    group: "{{ vnc_user }}"
+    mode: '0600'
+  become: true
+
+- name: Get OpenShift console URL if available
+  ansible.builtin.shell: |
+    oc whoami --show-console 2>/dev/null || echo ""
+  register: ocp_console_url
+  changed_when: false
+  failed_when: false
+  become: true
+  become_user: ec2-user
+
+- name: Get kubeadmin password if available
+  ansible.builtin.shell: |
+    cat /home/ec2-user/openshift-install/auth/kubeadmin-password 2>/dev/null || echo ""
+  register: kubeadmin_password
+  changed_when: false
+  failed_when: false
+  become: true
+  become_user: ec2-user
+
+- name: Create Firefox profile directory
+  ansible.builtin.file:
+    path: /home/{{ vnc_user }}/.mozilla/firefox/vnc.default
+    state: directory
+    owner: "{{ vnc_user }}"
+    group: "{{ vnc_user }}"
+    mode: '0755'
+    recurse: true
+  become: true
+  when:
+    - ocp_console_url.stdout != ""
+    - kubeadmin_password.stdout != ""
+
+- name: Create Firefox profiles.ini
+  ansible.builtin.copy:
+    dest: /home/{{ vnc_user }}/.mozilla/firefox/profiles.ini
+    owner: "{{ vnc_user }}"
+    group: "{{ vnc_user }}"
+    mode: '0644'
+    content: |
+      [Install4F96D1932A9F858E]
+      Default=vnc.default
+      Locked=1
+
+      [General]
+      StartWithLastProfile=1
+      Version=2
+
+      [Profile0]
+      Name=vnc.default
+      IsRelative=1
+      Path=vnc.default
+      Default=1
+  become: true
+  when:
+    - ocp_console_url.stdout != ""
+    - kubeadmin_password.stdout != ""
+
+- name: Create Firefox autoconfig loader
+  ansible.builtin.copy:
+    dest: /usr/lib64/firefox/defaults/pref/autoconfig.js
+    mode: '0644'
+    content: |
+      // Load Firefox configuration
+      pref("general.config.filename", "firefox.cfg");
+      pref("general.config.obscure_value", 0);
+  become: true
+  when:
+    - ocp_console_url.stdout != ""
+    - kubeadmin_password.stdout != ""
+
+- name: Create Firefox configuration with auto-fill script
+  ansible.builtin.copy:
+    dest: /usr/lib64/firefox/firefox.cfg
+    mode: '0644'
+    content: |
+      // Firefox AutoConfig
+
+      // Extract domain from console URL for matching
+      const CONSOLE_URL = "{{ ocp_console_url.stdout }}";
+      const CONSOLE_DOMAIN = CONSOLE_URL.replace(/^https?:\/\/([^\/]+).*$/, '$1');
+      const USERNAME = "kubeadmin";
+      const PASSWORD = "{{ kubeadmin_password.stdout }}";
+
+      // Enable security for enterprise roots
+      defaultPref("security.enterprise_roots.enabled", true);
+
+      // Auto-fill credentials on OpenShift login page
+      Components.utils.import("resource://gre/modules/Services.jsm");
+
+      // Observer to inject auto-fill script into login pages
+      var observer = {
+        observe: function(subject, topic, data) {
+          if (topic == "content-document-global-created") {
+            var win = subject;
+            win.addEventListener("DOMContentLoaded", function() {
+              var doc = win.document;
+              var location = doc.location;
+
+              // Check if we're on OpenShift console login page
+              if (location.hostname.indexOf(CONSOLE_DOMAIN) !== -1 ||
+                  location.hostname.indexOf("oauth-openshift.apps") !== -1) {
+
+                // Wait a moment for form to fully render
+                win.setTimeout(function() {
+                  // Try multiple possible field selectors
+                  var usernameField = doc.querySelector('input[name="username"]') ||
+                                    doc.querySelector('input[id="username"]') ||
+                                    doc.querySelector('input[type="text"]') ||
+                                    doc.querySelector('input[autocomplete="username"]');
+
+                  var passwordField = doc.querySelector('input[name="password"]') ||
+                                    doc.querySelector('input[id="password"]') ||
+                                    doc.querySelector('input[type="password"]') ||
+                                    doc.querySelector('input[autocomplete="current-password"]');
+
+                  if (usernameField && passwordField) {
+                    // Fill the fields
+                    usernameField.value = USERNAME;
+                    passwordField.value = PASSWORD;
+
+                    // Trigger input events so form validation recognizes the values
+                    usernameField.dispatchEvent(new win.Event('input', { bubbles: true }));
+                    usernameField.dispatchEvent(new win.Event('change', { bubbles: true }));
+                    passwordField.dispatchEvent(new win.Event('input', { bubbles: true }));
+                    passwordField.dispatchEvent(new win.Event('change', { bubbles: true }));
+
+                    // Optional: Auto-submit after a delay (disabled by default - user can click)
+                    // Uncomment the following lines to enable auto-submit:
+                    // win.setTimeout(function() {
+                    //   var submitButton = doc.querySelector('button[type="submit"]') ||
+                    //                     doc.querySelector('input[type="submit"]');
+                    //   if (submitButton) {
+                    //     submitButton.click();
+                    //   }
+                    // }, 500);
+                  }
+                }, 500);
+              }
+            }, false);
+          }
+        }
+      };
+
+      Services.obs.addObserver(observer, "content-document-global-created", false);
+  become: true
+  when:
+    - ocp_console_url.stdout != ""
+    - kubeadmin_password.stdout != ""
+
+- name: Create Firefox user.js with preferences
+  ansible.builtin.copy:
+    dest: /home/{{ vnc_user }}/.mozilla/firefox/vnc.default/user.js
+    owner: "{{ vnc_user }}"
+    group: "{{ vnc_user }}"
+    mode: '0644'
+    content: |
+      // Enable enterprise roots for SSL certificates
+      user_pref("security.enterprise_roots.enabled", true);
+      // Disable Firefox's built-in password manager (we're using autoconfig)
+      user_pref("signon.rememberSignons", false);
+      // Suppress password save prompts
+      user_pref("signon.autofillForms", false);
+  become: true
+  when:
+    - ocp_console_url.stdout != ""
+    - kubeadmin_password.stdout != ""
+
+- name: Initialize Firefox NSS certificate and password database
+  ansible.builtin.shell: |
+    certutil -N -d sql:/home/{{ vnc_user }}/.mozilla/firefox/vnc.default --empty-password
+  become: true
+  become_user: "{{ vnc_user }}"
+  args:
+    creates: /home/{{ vnc_user }}/.mozilla/firefox/vnc.default/cert9.db
+  when:
+    - ocp_console_url.stdout != ""
+    - ocp_ca_cert.stdout is defined
+    - ocp_ca_cert.stdout | length > 0
+
+- name: Save OpenShift CA cert to temp file
+  ansible.builtin.copy:
+    content: "{{ ocp_ca_cert.stdout }}"
+    dest: /tmp/openshift-ca.crt
+    mode: '0644'
+  become: true
+  when:
+    - ocp_console_url.stdout != ""
+    - ocp_ca_cert.stdout is defined
+    - ocp_ca_cert.stdout | length > 0
+
+- name: Delete existing OpenShift CA cert if present
+  ansible.builtin.shell: |
+    certutil -D -n "OpenShift CA" -d sql:/home/{{ vnc_user }}/.mozilla/firefox/vnc.default || true
+  become: true
+  become_user: "{{ vnc_user }}"
+  when:
+    - ocp_console_url.stdout != ""
+    - ocp_ca_cert.stdout is defined
+    - ocp_ca_cert.stdout | length > 0
+
+- name: Import OpenShift CA certificate into Firefox with correct trust flags
+  ansible.builtin.shell: |
+    certutil -A -n "OpenShift CA" -t "CT,," -i /tmp/openshift-ca.crt -d sql:/home/{{ vnc_user }}/.mozilla/firefox/vnc.default
+  become: true
+  become_user: "{{ vnc_user }}"
+  register: cert_import
+  when:
+    - ocp_console_url.stdout != ""
+    - ocp_ca_cert.stdout is defined
+    - ocp_ca_cert.stdout | length > 0
+
+- name: Verify certificate was imported
+  ansible.builtin.shell: |
+    certutil -L -d sql:/home/{{ vnc_user }}/.mozilla/firefox/vnc.default -n "OpenShift CA"
+  become: true
+  become_user: "{{ vnc_user }}"
+  register: cert_verify
+  changed_when: false
+  failed_when: false
+  when:
+    - ocp_console_url.stdout != ""
+    - ocp_ca_cert.stdout is defined
+    - ocp_ca_cert.stdout | length > 0
+
+- name: Display certificate trust attributes
+  debug:
+    msg: "OpenShift CA certificate trust: {{ cert_verify.stdout_lines }}"
+  when:
+    - cert_verify is defined
+    - cert_verify.rc is defined
+    - cert_verify.rc == 0
+
+- name: Remove temp CA cert file
+  ansible.builtin.file:
+    path: /tmp/openshift-ca.crt
+    state: absent
+  become: true
+  when:
+    - ocp_console_url.stdout != ""
+    - ocp_ca_cert.stdout is defined
+    - ocp_ca_cert.stdout | length > 0
+
+- name: Create VNC xstartup script for GNOME with Firefox auto-launch
+  ansible.builtin.copy:
+    dest: "/home/{{ vnc_user }}/.vnc/xstartup"
+    owner: "{{ vnc_user }}"
+    group: "{{ vnc_user }}"
+    mode: '0755'
+    content: |
+      #!/bin/sh
+      # Unset session manager
+      unset SESSION_MANAGER
+      unset DBUS_SESSION_BUS_ADDRESS
+
+      # Set XDG environment for GNOME
+      export XDG_SESSION_TYPE=x11
+      export XDG_CURRENT_DESKTOP=GNOME
+      export XDG_SESSION_CLASS=user
+
+      # Start GNOME with dbus-launch
+      dbus-launch --exit-with-session gnome-session &
+
+      # Wait for GNOME to start
+      sleep 15
+
+      # Auto-launch Firefox to OpenShift console if available
+      {% if ocp_console_url.stdout != "" %}
+      CONSOLE_URL="{{ ocp_console_url.stdout }}"
+      if [ ! -z "$CONSOLE_URL" ]; then
+        firefox --profile /home/{{ vnc_user }}/.mozilla/firefox/vnc.default "$CONSOLE_URL" &
+      fi
+      {% else %}
+      # Launch Firefox without URL if OpenShift not available
+      firefox --profile /home/{{ vnc_user }}/.mozilla/firefox/vnc.default &
+      {% endif %}
+
+      wait
+  become: true
+
+- name: Create VNC config file (localhost only)
+  ansible.builtin.copy:
+    dest: "/home/{{ vnc_user }}/.vnc/config"
+    owner: "{{ vnc_user }}"
+    group: "{{ vnc_user }}"
+    mode: '0644'
+    content: |
+      session=gnome
+      geometry=1920x1080
+      localhost=yes
+      alwaysshared
+      depth=24
+  become: true
+
+- name: Install dbus-x11 for GNOME session and NSS tools for Firefox certs
+  ansible.builtin.dnf:
+    name:
+      - dbus-x11
+      - xterm
+      - nss-tools
+    state: present
+  become: true
+
+- name: Kill any existing VNC sessions before starting service
+  ansible.builtin.shell: |
+    vncserver -kill :{{ vnc_display }} || true
+    pkill -u {{ vnc_user }} Xvnc || true
+  become: true
+  become_user: "{{ vnc_user }}"
+  failed_when: false
+
+- name: Clean up VNC temporary files
+  ansible.builtin.shell: |
+    rm -rf /home/{{ vnc_user }}/.vnc/*.log
+    rm -rf /home/{{ vnc_user }}/.vnc/*.pid
+    rm -rf /tmp/.X{{ vnc_display }}-lock
+    rm -rf /tmp/.X11-unix/X{{ vnc_display }}
+  become: true
+  failed_when: false
+
+- name: Start VNC manually (systemd has PID file permission issues)
+  ansible.builtin.shell: |
+    vncserver :{{ vnc_display }} -geometry 1920x1080 -localhost yes -depth 24
+  become: true
+  become_user: "{{ vnc_user }}"
+  register: vnc_start
+  failed_when: false
+
+- name: Wait for VNC to start
+  ansible.builtin.pause:
+    seconds: 5
+
+- name: Verify VNC is running
+  ansible.builtin.shell: |
+    ps aux | grep '[X]vnc.*:{{ vnc_display }}' || echo "VNC not running"
+  register: vnc_verify
+  changed_when: false
+
+- name: Display VNC status
+  debug:
+    msg: "VNC Status: {{ 'RUNNING ✓' if 'Xvnc' in vnc_verify.stdout else 'NOT RUNNING - Check logs' }}"
+
+- name: Create VNC auto-start script for reboot
+  ansible.builtin.copy:
+    dest: /home/{{ vnc_user }}/start-vnc.sh
+    owner: "{{ vnc_user }}"
+    group: "{{ vnc_user }}"
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      # Auto-start VNC after reboot
+      vncserver :{{ vnc_display }} -geometry 1920x1080 -localhost yes -depth 24
+  become: true
+
+- name: Add VNC auto-start to crontab
+  ansible.builtin.cron:
+    name: "Start VNC on reboot"
+    special_time: reboot
+    job: "/home/{{ vnc_user }}/start-vnc.sh"
+    user: "{{ vnc_user }}"
+  become: true
+
+- name: Create SSL certificate directory
+  ansible.builtin.file:
+    path: "{{ novnc_ssl_cert_dir }}"
+    state: directory
+    mode: '0755'
+  become: true
+
+- name: Generate self-signed SSL certificate for noVNC
+  ansible.builtin.shell: |
+    openssl req -x509 -nodes -newkey rsa:3072 -keyout {{ novnc_ssl_cert_dir }}/novnc.key \
+      -out {{ novnc_ssl_cert_dir }}/novnc.crt -days 3650 \
+      -subj "/C=US/ST=State/L=City/O=Organization/CN={{ ansible_host }}"
+    cat {{ novnc_ssl_cert_dir }}/novnc.crt {{ novnc_ssl_cert_dir }}/novnc.key > {{ novnc_ssl_cert_dir }}/novnc.pem
+    chmod 600 {{ novnc_ssl_cert_dir }}/novnc.pem
+  args:
+    creates: "{{ novnc_ssl_cert_dir }}/novnc.pem"
+  become: true
+
+- name: Create noVNC HTTP websockify systemd service (no VNC dependency)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/novnc-http.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=noVNC HTTP Server
+      After=network.target
+
+      [Service]
+      Type=simple
+      User=root
+      ExecStart=/usr/local/bin/websockify --web {{ novnc_install_dir }} {{ novnc_http_port }} localhost:{{ vnc_port }}
+      Restart=on-failure
+      RestartSec=10
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+  register: novnc_http_service
+
+- name: Create noVNC HTTPS websockify systemd service (no VNC dependency)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/novnc-https.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=noVNC HTTPS Server
+      After=network.target
+
+      [Service]
+      Type=simple
+      User=root
+      ExecStart=/usr/local/bin/websockify --web {{ novnc_install_dir }} --cert {{ novnc_ssl_cert_dir }}/novnc.pem {{ novnc_https_port }} localhost:{{ vnc_port }}
+      Restart=on-failure
+      RestartSec=10
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+  register: novnc_https_service
+
+- name: Reload systemd daemon after adding noVNC services
+  ansible.builtin.systemd:
+    daemon_reload: true
+  become: true
+  when: novnc_http_service.changed or novnc_https_service.changed
+
+- name: Restart noVNC HTTP service if config changed
+  ansible.builtin.systemd:
+    name: novnc-http.service
+    enabled: true
+    state: restarted
+  become: true
+  when: novnc_http_service.changed
+
+- name: Restart noVNC HTTPS service if config changed
+  ansible.builtin.systemd:
+    name: novnc-https.service
+    enabled: true
+    state: restarted
+  become: true
+  when: novnc_https_service.changed
+
+- name: Ensure noVNC HTTP service is running
+  ansible.builtin.systemd:
+    name: novnc-http.service
+    enabled: true
+    state: started
+  become: true
+  when: not novnc_http_service.changed
+
+- name: Ensure noVNC HTTPS service is running
+  ansible.builtin.systemd:
+    name: novnc-https.service
+    enabled: true
+    state: started
+  become: true
+  when: not novnc_https_service.changed
+
+- name: Configure firewalld to allow noVNC HTTP
+  ansible.posix.firewalld:
+    port: "{{ novnc_http_port }}/tcp"
+    zone: "{{ vnc_firewall_zone }}"
+    permanent: true
+    state: enabled
+    immediate: true
+  become: true
+  failed_when: false
+
+- name: Configure firewalld to allow noVNC HTTPS
+  ansible.posix.firewalld:
+    port: "{{ novnc_https_port }}/tcp"
+    zone: "{{ vnc_firewall_zone }}"
+    permanent: true
+    state: enabled
+    immediate: true
+  become: true
+  failed_when: false
+
+- name: Get EC2 instance security group
+  amazon.aws.ec2_instance_info:
+    region: "{{ aws_region }}"
+    filters:
+      "tag:Name": "{{ instance_name }}"
+      "instance-state-name": ["running"]
+  register: instance_info
+  delegate_to: localhost
+  become: false
+
+- name: Extract security group ID
+  set_fact:
+    security_group_id: "{{ instance_info.instances[0].security_groups[0].group_id }}"
+
+- name: Get current security group details
+  amazon.aws.ec2_security_group_info:
+    region: "{{ aws_region }}"
+    filters:
+      group-id: "{{ security_group_id }}"
+  register: sg_info
+  delegate_to: localhost
+  become: false
+
+- name: Extract current security group details
+  set_fact:
+    security_group_name: "{{ sg_info.security_groups[0].group_name }}"
+    security_group_description: "{{ sg_info.security_groups[0].description }}"
+    security_group_vpc_id: "{{ sg_info.security_groups[0].vpc_id }}"
+
+- name: Update security group with noVNC ports
+  amazon.aws.ec2_security_group:
+    name: "{{ security_group_name }}"
+    description: "{{ security_group_description }}"
+    vpc_id: "{{ security_group_vpc_id }}"
+    region: "{{ aws_region }}"
+    group_id: "{{ security_group_id }}"
+    rules:
+      - proto: tcp
+        ports:
+          - "{{ novnc_http_port }}"
+        cidr_ip: 0.0.0.0/0
+        rule_desc: "noVNC HTTP access"
+      - proto: tcp
+        ports:
+          - "{{ novnc_https_port }}"
+        cidr_ip: 0.0.0.0/0
+        rule_desc: "noVNC HTTPS access"
+    purge_rules: false
+  delegate_to: localhost
+  become: false
+
+- name: Check if OpenShift cluster is accessible
+  ansible.builtin.shell: |
+    oc whoami 2>/dev/null
+  register: oc_check
+  changed_when: false
+  failed_when: false
+  become: true
+  become_user: ec2-user
+
+- name: Extract OpenShift CA certificate from kubeconfig
+  ansible.builtin.shell: |
+    grep certificate-authority-data /home/ec2-user/.kube/config | awk '{print $2}' | base64 -d
+  register: ocp_ca_cert
+  become: true
+  become_user: ec2-user
+  when: oc_check.rc == 0
+
+- name: Install OpenShift CA certificate to system trust
+  ansible.builtin.copy:
+    content: "{{ ocp_ca_cert.stdout }}"
+    dest: /etc/pki/ca-trust/source/anchors/openshift-ca.crt
+    mode: '0644'
+  become: true
+  when:
+    - oc_check.rc == 0
+    - ocp_ca_cert.stdout is defined
+    - ocp_ca_cert.stdout | length > 0
+
+- name: Update CA trust
+  ansible.builtin.command: update-ca-trust
+  become: true
+  when:
+    - oc_check.rc == 0
+    - ocp_ca_cert.stdout is defined
+    - ocp_ca_cert.stdout | length > 0
+
+- name: Get OpenShift console URL
+  ansible.builtin.shell: |
+    oc whoami --show-console 2>/dev/null || echo "Not available"
+  register: console_url
+  changed_when: false
+  become: true
+  become_user: ec2-user
+  when: oc_check.rc == 0
+
+- name: Get EC2 public IP
+  set_fact:
+    ec2_public_ip: "{{ instance_info.instances[0].public_ip_address }}"
+
+- name: Display noVNC access information
+  debug:
+    msg:
+      - "=========================================="
+      - "✓ noVNC Web-based GUI Setup Complete"
+      - "=========================================="
+      - ""
+      - "Access desktop via web browser (NO VNC CLIENT NEEDED):"
+      - ""
+      - "HTTP Access (unencrypted):"
+      - "  http://{{ ec2_public_ip }}:{{ novnc_http_port }}/vnc.html"
+      - ""
+      - "HTTPS Access (encrypted, self-signed cert):"
+      - "  https://{{ ec2_public_ip }}:{{ novnc_https_port }}/vnc.html"
+      - ""
+      - "VNC Password: {{ vnc_password }}"
+      - ""
+      - "Steps to connect:"
+      - "  1. Open URL in web browser"
+      - "  2. Accept certificate warning (HTTPS only)"
+      - "  3. Click 'Connect' button"
+      - "  4. Enter password: {{ vnc_password }}"
+      - "  5. Wait 10-15 seconds for GNOME to load"
+      - "  {% if ocp_console_url.stdout != '' and kubeadmin_password.stdout != '' %}6. Firefox will auto-open to OpenShift console with credentials auto-filled!{% endif %}"
+      - ""
+      - "Desktop Environment: GNOME (with dbus-launch)"
+      - "Browser: Firefox (pre-installed)"
+      - "VNC Display: :{{ vnc_display }} on localhost:{{ vnc_port }}"
+      - "Note: Using port {{ vnc_port }} to avoid conflicts with libvirt VMs (5900-5910)"
+      - ""
+      - "{% if ocp_console_url.stdout != '' %}OpenShift Console: {{ ocp_console_url.stdout }}{% endif %}"
+      - "{% if ocp_console_url.stdout != '' %}  - Firefox auto-launches to console ✓{% endif %}"
+      - "{% if kubeadmin_password.stdout != '' %}  - kubeadmin credentials auto-fill in login form (via Firefox autoconfig) ✓{% endif %}"
+      - "{% if kubeadmin_password.stdout != '' %}  - Just click 'Log In' button - no typing needed! ✓{% endif %}"
+      - "{% if oc_check is defined and oc_check.rc is defined and oc_check.rc == 0 %}OpenShift CA: Trusted by system ✓{% endif %}"
+      - "{% if cert_verify is defined and cert_verify.rc is defined and cert_verify.rc == 0 %}  - OpenShift CA imported into Firefox - no certificate warnings! ✓{% endif %}"
+      - ""
+      - "Security Group: Updated to allow ports {{ novnc_http_port }}, {{ novnc_https_port }}"
+      - "Firewall: Configured to allow noVNC access"
+      - ""
+      - "VNC server runs on localhost only (more secure)."
+      - "Auto-starts on reboot via cron @reboot."
+      - "{% if ocp_console_url.stdout != '' %}Firefox auto-launches to OpenShift console.{% endif %}"
+      - "Access only through noVNC web interface."
+      - ""
+      - "To manually restart VNC:"
+      - "  ~/start-vnc.sh"
+      - ""
+      - "To check VNC status:"
+      - "  ps aux | grep Xvnc"
+      - ""
+      - "=========================================="

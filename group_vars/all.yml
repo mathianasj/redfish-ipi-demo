@@ -1,0 +1,49 @@
+---
+# AWS Configuration
+aws_region: us-east-2
+
+# Instance Types that support nested virtualization (non-bare-metal):
+# - M6i, M7i, M7a families (e.g., m6i.2xlarge, m7i.xlarge)
+# - C6i, C7i, C7a families (e.g., c6i.2xlarge, c7i.xlarge)
+# - R6i, R7i, R7a families (e.g., r6i.2xlarge, r7i.xlarge)
+# - M5n, M5zn, C5n, R5n families (older gen)
+# Recommended: m7i.2xlarge (~$0.40/hr) or m6i.2xlarge (~$0.38/hr)
+instance_type: m8i.16xlarge
+
+# AMI IDs by region (RHEL 9)
+# To find latest RHEL 9 AMI: aws ec2 describe-images --region <region> --owners 309956199498 --filters "Name=name,Values=RHEL-9*"
+ami_mappings:
+  us-east-2: ami-0583ca2478b00847a  # RHEL 9
+  us-east-1: ami-0583d2117fb4e3050  # RHEL 9
+  us-west-2: ami-0b8c6b923777519db  # RHEL 9
+
+# SSH Key Configuration
+key_name: nested-virt-key  # EC2 key pair name to create
+ssh_public_key_path: "~/.ssh/id_rsa_fips.pub"  # Path to your SSH public key
+ssh_private_key_path: "~/.ssh/id_rsa_fips"  # Path to your SSH private key
+
+# Network Configuration
+vpc_cidr: 10.0.0.0/16
+subnet_cidr: 10.0.1.0/24
+
+# Instance Configuration
+instance_name: nested-virt-host
+root_volume_size: 500  # GB - Root/boot volume
+storage_volume_size: 1024  # GB (1TB) - for VMs, ISOs, and backups
+openshift_volume_size: 500  # GB - for OpenShift VM images
+
+# CPU Options for nested virtualization
+# Adjust based on instance type:
+# m8i.16xlarge: 32 cores, 64 vCPUs (2 threads per core)
+# m7i.16xlarge: 32 cores, 64 vCPUs (2 threads per core)
+# m7i.2xlarge: 4 cores, 8 vCPUs (2 threads per core)
+cpu_core_count: 32  # Number of CPU cores
+cpu_threads_per_core: 2  # 2 = hyperthreading enabled, 1 = disabled
+
+# Cockpit Admin User
+cockpit_admin_user: admin
+cockpit_admin_password: "ChangeMe123!"  # IMPORTANT: Change this to a secure password!
+
+# VM Storage Configuration
+vm_storage_path: /var/lib/libvirt/images
+vm_storage_size: 500  # GB - can be expanded with additional EBS volumes

@@ -1,0 +1,12 @@
+---
+# OpenShift cluster configuration
+ocp_cluster_name: ocp
+ocp_base_domain: example.com  # Should match dns_domain in configure_dns role
+
+# All network configuration (IPs, MACs, etc.) is dynamically discovered
+# from the virbr0 network on the target EC2 instance.
+#
+# To override the cluster name or domain, set these variables in your playbook:
+#   vars:
+#     ocp_cluster_name: myocp
+#     ocp_base_domain: lab.example.com  # Must match configure_dns dns_domain
