@@ -141,10 +141,17 @@ ssh ec2-user@<instance-ip>
 # Get cluster credentials
 cat ~/openshift-cluster-access.txt
 
-# Access web console
-https://console-openshift-console.apps.ocp.example.com
+# Access web console (requires noVNC)
+# The playbook exposes a noVNC web endpoint at:
+#   https://<instance-ip>:6081/vnc.html
+# 
+# Example: https://3.145.67.89:6081/vnc.html
+# Password: redhat123 (default)
+# 
+# Firefox will auto-launch to the OpenShift console with credentials pre-filled
+# See VNC_ACCESS_GUIDE.md for detailed instructions
 
-# Use CLI
+# Use CLI (from EC2 instance)
 export KUBECONFIG=~/openshift-install/auth/kubeconfig
 oc get nodes
 oc get co  # Check cluster operators
