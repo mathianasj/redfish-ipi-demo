@@ -168,7 +168,7 @@ podman logs -f $(podman ps | grep quay | awk '{print $1}')
 - Time on home internet: 1.5-8+ hours
 - Disk space needed: 100+ GB free
 
-**See [OC-MIRROR-TIMING.md](../OC-MIRROR-TIMING.md) for:**
+**See [OC-MIRROR-TIMING.md](../../docs/disconnected/OC-MIRROR-TIMING.md) for:**
 - Detailed size breakdowns
 - Time estimates by connection speed
 - Best practices and tips

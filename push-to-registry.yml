@@ -307,7 +307,7 @@
                oc apply -f <icsp-file>
             Or add to install-config.yaml for new installations
 
-          See MIRROR-REGISTRY-GUIDE.md for more details
+          See docs/disconnected/MIRROR-REGISTRY-GUIDE.md for more details
         dest: /home/ec2-user/push-status.txt
         mode: '0644'
         owner: ec2-user

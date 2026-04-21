@@ -54,7 +54,7 @@ ssh ec2-user@<public-ip>
 dig @localhost api.sno.example.com
 ```
 
-See [DNS_SETUP.md](DNS_SETUP.md) for details.
+See [../infrastructure/DNS_SETUP.md](../infrastructure/DNS_SETUP.md) for details.
 
 ## Common Tasks
 
@@ -100,7 +100,7 @@ sudo virsh console myvm
 ip addr show baremetal
 ```
 
-See [NETWORKING.md](NETWORKING.md) for network details.
+See [../infrastructure/NETWORKING.md](../infrastructure/NETWORKING.md) for network details.
 
 ### Use Redfish Virtual Media
 
@@ -144,7 +144,7 @@ sudo virsh vol-list default
 ansible-playbook cleanup.yml -e confirm_deletion=true
 ```
 
-See [CLEANUP.md](CLEANUP.md) for details.
+See [../infrastructure/CLEANUP.md](../infrastructure/CLEANUP.md) for details.
 
 ## Troubleshooting
 
@@ -203,7 +203,7 @@ sudo nmcli connection up baremetal
 | `group_vars/all.yml` | Configuration variables |
 | `openshift-sno-install-config.yaml` | OpenShift install config |
 | `README.md` | Full documentation |
-| `CLEANUP.md` | Cleanup guide |
+| `../infrastructure/CLEANUP.md` | Cleanup guide |
 | `RHEL_SETUP.md` | RHEL 9 specific info |
 | `SUSHY_REDFISH.md` | Redfish API guide |
 | `CPU_OPTIONS.md` | CPU configuration guide |
@@ -223,4 +223,4 @@ Use spot instances for 60-90% savings!
 - [Deploy Playbook](playbook.yml)
 - [Cleanup Playbook](cleanup.yml)
 - [Configuration](group_vars/all.yml)
-- [Full Documentation](README.md)
+- [Full Documentation](../../README.md)

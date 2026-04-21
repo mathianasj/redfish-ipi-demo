@@ -349,33 +349,40 @@ For network isolation and advanced routing:
 
 ## Documentation
 
-### Quick References
-- [QUICK_START.md](QUICK_START.md) - Fast deployment guide
-- [QUICK_REFERENCE.md](QUICK_REFERENCE.md) - Common commands
+### 📘 Getting Started
+- **[Quick Start Guide](docs/getting-started/QUICK_START.md)** - Fast deployment walkthrough
+- **[Quick Reference](docs/getting-started/QUICK_REFERENCE.md)** - Common commands and operations
 
-### Infrastructure Setup
-- [RHEL_SETUP.md](RHEL_SETUP.md) - RHEL 9 configuration
-- [NETWORKING.md](NETWORKING.md) - Network architecture
-- [DNS_SETUP.md](DNS_SETUP.md) - DNS configuration for OpenShift
-- [INSTANCE_TYPES.md](INSTANCE_TYPES.md) - AWS instance comparison
+### 🏗️ Infrastructure Setup
+- **[Instance Types](docs/infrastructure/INSTANCE_TYPES.md)** - AWS instance comparison and recommendations
+- **[RHEL Setup](docs/infrastructure/RHEL_SETUP.md)** - RHEL 9 configuration and preparation
+- **[Networking](docs/infrastructure/NETWORKING.md)** - Network architecture and configuration
+- **[DNS Setup](docs/infrastructure/DNS_SETUP.md)** - DNS configuration for OpenShift
+- **[Cleanup](docs/infrastructure/CLEANUP.md)** - Resource deletion and teardown
+- **[Instance Management](docs/infrastructure/INSTANCE-MANAGEMENT-README.md)** - EC2 instance lifecycle
 
-### Redfish & OpenShift
-- [SUSHY_REDFISH.md](SUSHY_REDFISH.md) - Redfish API guide
-- [COMPLETE_DEPLOYMENT.md](COMPLETE_DEPLOYMENT.md) - Full deployment workflow
+### 🔴 OpenShift Deployment
+- **[Complete Deployment](docs/openshift/COMPLETE_DEPLOYMENT.md)** - End-to-end deployment workflow
+- **[install-config.yaml Guide](docs/openshift/INSTALL-CONFIG-GUIDE.md)** - Field reference and configuration examples
+- **[Redfish/BMC Guide](docs/openshift/SUSHY_REDFISH.md)** - Redfish API integration and usage
+- **[Pull Secret Setup](docs/openshift/PULL-SECRET.md)** - Red Hat pull secret configuration
 
-### Troubleshooting
-- [KVM_NESTED_VIRT_FIX.md](KVM_NESTED_VIRT_FIX.md) - Nested virt issues
-- [VM_PAUSED_TROUBLESHOOTING.md](VM_PAUSED_TROUBLESHOOTING.md) - VM stability
-- [CPU_OPTIONS.md](CPU_OPTIONS.md) - CPU configuration
+### 🔌 Disconnected/Air-Gapped Environments
+- **[Mirror Registry Guide](docs/disconnected/MIRROR-REGISTRY-GUIDE.md)** - Complete mirror registry setup and workflow
+- **[Mirror Timing & Sizing](docs/disconnected/OC-MIRROR-TIMING.md)** - Download estimates and best practices
 
-### Management
-- [VNC_ACCESS_GUIDE.md](VNC_ACCESS_GUIDE.md) - Remote desktop access
-- [CLEANUP.md](CLEANUP.md) - Resource deletion
+### 🔧 Troubleshooting
+- **[KVM Nested Virtualization Fix](docs/troubleshooting/KVM_NESTED_VIRT_FIX.md)** - Resolve nested virt issues
+- **[VM Paused Troubleshooting](docs/troubleshooting/VM_PAUSED_TROUBLESHOOTING.md)** - Fix VM stability problems
+- **[CPU Options](docs/troubleshooting/CPU_OPTIONS.md)** - CPU configuration and tuning
+- **[KVM Error Prevention](docs/troubleshooting/KVM_ERROR_PREVENTION.md)** - Prevent common KVM errors
+- **[Nested Virt Detection](docs/troubleshooting/NESTED-VIRT-DETECTION.md)** - Verify nested virtualization
+- **[Memory Changes Revert](docs/troubleshooting/REVERT_MEMORY_CHANGES.md)** - Undo memory configuration changes
 
-### Disconnected/Air-Gapped Environments
-- [MIRROR-REGISTRY-GUIDE.md](MIRROR-REGISTRY-GUIDE.md) - Complete mirror registry setup and workflow
-- [OC-MIRROR-TIMING.md](OC-MIRROR-TIMING.md) - Mirror timing, sizing, and best practices
-- [PULL-SECRET.md](PULL-SECRET.md) - Red Hat pull secret setup
+### 🚀 Advanced Topics
+- **[VNC Access Guide](docs/advanced/VNC_ACCESS_GUIDE.md)** - Remote desktop and console access
+- **[VyOS VM Guide](docs/advanced/VYOS_VM_GUIDE.md)** - VyOS router deployment and configuration
+- **[Dynamic Inventory](docs/advanced/README-INVENTORY.md)** - Ansible dynamic inventory for EC2
 
 ## Cost Estimation
 
