@@ -159,7 +159,7 @@
 
 - name: Download mirror-registry tool
   ansible.builtin.get_url:
-    url: https://mirror.openshift.com/pub/openshift-v4/clients/mirror-registry/latest/mirror-registry.tar.gz
+    url: https://mirror.openshift.com/pub/cgw/mirror-registry/latest/mirror-registry-amd64.tar.gz
     dest: /tmp/mirror-registry.tar.gz
     mode: '0644'
     timeout: 300
