@@ -346,7 +346,7 @@ Before configuring hosts, you need to assign two virtual IP addresses:
 - ✅ Both VIPs **MUST** be within the `machineNetwork` CIDR (e.g., `10.0.10.0/24`)
 - ✅ VIPs **MUST** be outside DHCP range (use static allocation range)
 - ✅ VIPs **MUST** be unused IPs (not assigned to any host)
-- ✅ VIPs **MUST** have DNS A records (or /etc/hosts entries)
+- ✅ VIPs **MUST** have DNS A records
 - ✅ VIPs **MUST** be reachable from all cluster nodes
 
 **Example Network Planning:**
@@ -692,20 +692,31 @@ nslookup api.ocp.example.com
 # Test wildcard apps resolution
 nslookup test.apps.ocp.example.com
 # Should return: 10.0.10.6
-
-# Test from the servers themselves (if accessible)
-ssh root@<server-ip> "nslookup api.ocp.example.com"
 ```
 
-**If DNS is not configured**, you have two options:
+**CRITICAL: If DNS is not configured, the installation will fail.**
 
-1. **Set up proper DNS** (recommended for production)
-2. **Use /etc/hosts** (testing only):
+RHCOS nodes are immutable and cannot have /etc/hosts modified. You **MUST** configure proper DNS before installation:
+
+1. **Create DNS A records:**
+   ```
+   api.ocp.example.com          IN  A  10.0.10.5
+   *.apps.ocp.example.com       IN  A  10.0.10.6
+   ```
+
+2. **Or use dnsmasq for testing:**
    ```bash
-   # On your workstation and all servers
-   echo "10.0.10.5  api.ocp.example.com" >> /etc/hosts
-   echo "10.0.10.6  oauth-openshift.apps.ocp.example.com" >> /etc/hosts
-   echo "10.0.10.6  console-openshift-console.apps.ocp.example.com" >> /etc/hosts
+   # On a DNS server or your workstation (if acting as DNS)
+   echo "address=/api.ocp.example.com/10.0.10.5" >> /etc/dnsmasq.d/openshift.conf
+   echo "address=/apps.ocp.example.com/10.0.10.6" >> /etc/dnsmasq.d/openshift.conf
+   systemctl restart dnsmasq
+   ```
+
+3. **Verify DNS works from installer machine:**
+   ```bash
+   nslookup api.ocp.example.com
+   nslookup test.apps.ocp.example.com
+   # Both should resolve correctly
    ```
 
 ### Step 6: Start the Installation
