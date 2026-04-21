@@ -65,9 +65,11 @@ Before creating your install-config.yaml, gather this information:
 
 - **BMC IP Address**: Out-of-band management IP
 - **BMC Username/Password**: Credentials for Redfish API
-- **BMC MAC Address**: MAC address of the primary NIC (for PXE boot)
+- **Boot MAC Address**: MAC address of the primary NIC (used to identify the correct network interface)
 - **System UUID**: Redfish system identifier
 - **Boot Device**: Disk to install to (e.g., `/dev/sda`)
+
+**Note**: When using `redfish-virtualmedia://` with `provisioningNetwork: Disabled`, PXE is NOT used. The MAC address identifies which network interface should receive the IP configuration, but boot happens via virtual media (ISO mounting).
 
 ### OpenShift Requirements
 
@@ -504,9 +506,29 @@ When you run `openshift-install create cluster`, here's what happens:
 2. **Cluster becomes ready**
 3. **Installer completes**
 
-### Day 2: BareMetalHost Resources
+### Day 2: Adding Worker Nodes
 
-After installation, OpenShift manages baremetal nodes as Kubernetes resources:
+After installation, you can add worker nodes using BareMetalHost and MachineSet resources.
+
+#### Step 1: Create BMC Credentials Secret
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: worker-1-bmc-secret
+  namespace: openshift-machine-api
+type: Opaque
+stringData:
+  username: admin
+  password: bmcpassword
+```
+
+```bash
+oc apply -f worker-1-bmc-secret.yaml
+```
+
+#### Step 2: Create BareMetalHost Resource
 
 ```yaml
 apiVersion: metal3.io/v1alpha1
@@ -514,6 +536,8 @@ kind: BareMetalHost
 metadata:
   name: worker-1
   namespace: openshift-machine-api
+  labels:
+    infraenvs.agent-install.openshift.io: ""
 spec:
   online: true
   bmc:
@@ -525,11 +549,143 @@ spec:
     deviceName: "/dev/sda"
 ```
 
+```bash
+oc apply -f worker-1-bmh.yaml
+```
+
+**Check BareMetalHost status:**
+```bash
+oc get baremetalhosts -n openshift-machine-api
+```
+
+The host should go through these states:
+1. `registering` - BMC credentials validated
+2. `inspecting` - Hardware inventory gathered
+3. `available` - Ready to be provisioned
+
+#### Step 3: Create MachineSet to Provision Workers
+
+**Important**: Creating a BareMetalHost alone does NOT provision a worker. You must create a MachineSet that references the host.
+
+```yaml
+apiVersion: machine.openshift.io/v1beta1
+kind: MachineSet
+metadata:
+  name: worker
+  namespace: openshift-machine-api
+  labels:
+    machine.openshift.io/cluster-api-cluster: <cluster-id>
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      machine.openshift.io/cluster-api-cluster: <cluster-id>
+      machine.openshift.io/cluster-api-machineset: worker
+  template:
+    metadata:
+      labels:
+        machine.openshift.io/cluster-api-cluster: <cluster-id>
+        machine.openshift.io/cluster-api-machine-role: worker
+        machine.openshift.io/cluster-api-machine-type: worker
+        machine.openshift.io/cluster-api-machineset: worker
+    spec:
+      metadata: {}
+      providerSpec:
+        value:
+          apiVersion: baremetal.cluster.k8s.io/v1alpha1
+          kind: BareMetalMachineProviderSpec
+          image:
+            url: <rhcos-image-url>
+            checksum: <checksum>
+          userData:
+            name: worker-user-data
+```
+
+**Get cluster ID:**
+```bash
+oc get -o jsonpath='{.status.infrastructureName}{"\n"}' infrastructure cluster
+```
+
+**Get existing MachineSet as template:**
+```bash
+# If you have existing worker machines from install
+oc get machineset -n openshift-machine-api -o yaml
+
+# Or get master machineset as reference
+oc get machineset -n openshift-machine-api -o yaml
+```
+
+**Create MachineSet:**
+```bash
+oc apply -f worker-machineset.yaml
+```
+
+**Monitor provisioning:**
+```bash
+# Watch machines being created
+oc get machines -n openshift-machine-api -w
+
+# Watch BareMetalHosts being provisioned
+oc get baremetalhosts -n openshift-machine-api -w
+
+# Watch nodes joining cluster
+oc get nodes -w
+```
+
+#### Step 4: Disable Control Plane Scheduling (Optional)
+
+Once you have workers, you can prevent workloads from scheduling on control plane nodes:
+
+```bash
+# Mark each master as unschedulable for regular workloads
+oc adm cordon master-1
+oc adm cordon master-2
+oc adm cordon master-3
+
+# Or use a more surgical approach - remove worker role
+oc label node master-1 node-role.kubernetes.io/worker-
+oc label node master-2 node-role.kubernetes.io/worker-
+oc label node master-3 node-role.kubernetes.io/worker-
+
+# Add infra taint to prevent scheduling
+oc adm taint nodes master-1 node-role.kubernetes.io/master=:NoSchedule
+oc adm taint nodes master-2 node-role.kubernetes.io/master=:NoSchedule
+oc adm taint nodes master-3 node-role.kubernetes.io/master=:NoSchedule
+```
+
+**Verify:**
+```bash
+# Check node status
+oc get nodes
+
+# Should show:
+# master-1   Ready    control-plane,master   ...   (with taints)
+# master-2   Ready    control-plane,master   ...   (with taints)
+# master-3   Ready    control-plane,master   ...   (with taints)
+# worker-1   Ready    worker                 ...
+# worker-2   Ready    worker                 ...
+```
+
+**Important**: System pods (kube-apiserver, etcd, etc.) use tolerations to run on masters even with taints. User workloads will only schedule on worker nodes.
+
+### How the Bare Metal Operator Works
+
 The **Bare Metal Operator** uses Redfish to:
 - Power on/off nodes
 - Mount ISOs for provisioning
 - Monitor hardware status
 - Handle node lifecycle
+- Provision/deprovision machines automatically
+
+When you create a MachineSet with replicas > available BareMetalHosts:
+1. Operator selects an `available` BareMetalHost
+2. Powers off the host via Redfish
+3. Mounts RHCOS ISO via Redfish virtual media
+4. Powers on the host
+5. Host boots RHCOS and joins cluster
+6. BareMetalHost state changes to `provisioned`
+7. Machine becomes `Running`
+8. Node becomes `Ready`
 
 ## Real World Considerations
 
@@ -561,7 +717,28 @@ additionalTrustBundle: |
 
 ### Network Planning
 
-**Typical baremetal network layout:**
+#### Provisioning Network: Managed vs Disabled
+
+OpenShift baremetal IPI supports two provisioning modes:
+
+**Disabled Mode** (Recommended - used in this guide):
+- `provisioningNetwork: Disabled`
+- Uses Redfish virtual media to mount ISOs
+- No PXE infrastructure required
+- Simpler network topology
+- Better for environments where virtual media is supported
+
+**Managed Mode** (Legacy/Special cases):
+- `provisioningNetwork: Managed`
+- Uses PXE boot over a dedicated provisioning network
+- Requires DHCP/PXE infrastructure
+- More complex network setup
+- Used when BMC doesn't support virtual media
+- Being deprecated in favor of Disabled mode
+
+**This guide assumes `provisioningNetwork: Disabled`** - all examples use Redfish virtual media, not PXE.
+
+#### Typical baremetal network layout (Disabled mode):
 
 ```
 ┌─────────────────────────────────────────┐
@@ -572,10 +749,12 @@ additionalTrustBundle: |
 └─────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────┐
-│ Provisioning Network (Optional)         │
+│ Provisioning Network (NOT USED)         │
 │ VLAN 200: 172.22.0.0/24                 │
-│ - Used if provisioningNetwork: Managed  │
-│ - PXE boot network                      │
+│ - Only needed if provisioningNetwork:   │
+│   Managed (deprecated approach)         │
+│ - Uses PXE instead of virtual media     │
+│ - This guide uses Disabled mode         │
 └─────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────┐
