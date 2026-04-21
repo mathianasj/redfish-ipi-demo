@@ -1,0 +1,26 @@
+---
+# Route53 Configuration
+
+# Option 1: Use existing hosted zone by ID
+# route53_hosted_zone_id: Z1234567890ABC
+
+# Option 2: Use domain name (will create hosted zone if it doesn't exist)
+# route53_domain_name: example.com
+
+# DNS domain (inherited from parent, but can be overridden)
+dns_domain: example.com
+
+# TTL for DNS records in seconds
+route53_record_ttl: 300
+
+# Whether to wait for DNS propagation
+route53_wait_for_propagation: true
+
+# Time to wait for DNS propagation in seconds
+route53_propagation_wait: 30
+
+# Whether to verify DNS resolution after creation
+route53_verify_dns: false
+
+# AWS region for Route53 operations (Route53 is global, but API calls need a region)
+aws_region: us-east-1

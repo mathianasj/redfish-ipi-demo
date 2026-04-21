@@ -1,0 +1,104 @@
+#---------------------------------------------------------------------
+# HAProxy configuration for OpenShift passthrough proxy
+# This configuration proxies external traffic from EC2 public IP
+# to internal OpenShift cluster IPs
+#---------------------------------------------------------------------
+
+#---------------------------------------------------------------------
+# Global settings
+#---------------------------------------------------------------------
+global
+    log         127.0.0.1 local2
+    chroot      /var/lib/haproxy
+    pidfile     /var/run/haproxy.pid
+    maxconn     4000
+    user        haproxy
+    group       haproxy
+    daemon
+
+    # turn on stats unix socket
+    stats socket /var/lib/haproxy/stats
+
+    # utilize system-wide crypto-policies
+    ssl-default-bind-ciphers PROFILE=SYSTEM
+    ssl-default-server-ciphers PROFILE=SYSTEM
+
+#---------------------------------------------------------------------
+# Common defaults
+#---------------------------------------------------------------------
+defaults
+    mode                    tcp
+    log                     global
+    option                  tcplog
+    option                  dontlognull
+    option                  redispatch
+    retries                 3
+    timeout queue           1m
+    timeout connect         10s
+    timeout client          1m
+    timeout server          1m
+    timeout check           10s
+    maxconn                 3000
+
+#---------------------------------------------------------------------
+# HAProxy Statistics
+#---------------------------------------------------------------------
+{% if haproxy_stats_enabled | default(true) %}
+listen stats
+    bind *:9000
+    mode http
+    stats enable
+    stats uri /stats
+    stats realm HAProxy\ Statistics
+    stats auth {{ haproxy_stats_user | default('admin') }}:{{ haproxy_stats_password | default('admin') }}
+    stats refresh 30s
+    stats show-legends
+    stats show-node
+{% endif %}
+
+#---------------------------------------------------------------------
+# OpenShift API (6443) - TCP Passthrough
+#---------------------------------------------------------------------
+frontend api_frontend
+    bind *:6443
+    mode tcp
+    option tcplog
+    default_backend api_backend
+
+backend api_backend
+    mode tcp
+    balance roundrobin
+    option tcp-check
+    server api {{ openshift_api_ip }}:6443 check
+
+#---------------------------------------------------------------------
+# OpenShift Apps HTTPS (443) - TCP Passthrough with SNI
+#---------------------------------------------------------------------
+frontend ingress_https_frontend
+    bind *:443
+    mode tcp
+    option tcplog
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req_ssl_hello_type 1 }
+    default_backend ingress_https_backend
+
+backend ingress_https_backend
+    mode tcp
+    balance roundrobin
+    option tcp-check
+    server ingress {{ openshift_ingress_ip }}:443 check
+
+#---------------------------------------------------------------------
+# OpenShift Apps HTTP (80) - TCP Passthrough
+#---------------------------------------------------------------------
+frontend ingress_http_frontend
+    bind *:80
+    mode tcp
+    option tcplog
+    default_backend ingress_http_backend
+
+backend ingress_http_backend
+    mode tcp
+    balance roundrobin
+    option tcp-check
+    server ingress {{ openshift_ingress_ip }}:80 check

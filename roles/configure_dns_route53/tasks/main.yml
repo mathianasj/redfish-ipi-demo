@@ -1,0 +1,133 @@
+---
+- name: Validate Route53 configuration
+  assert:
+    that:
+      - route53_hosted_zone_id is defined or route53_domain_name is defined
+      - dns_domain is defined
+      - cluster_name is defined
+      - api_vip is defined
+      - ingress_vip is defined
+    fail_msg: "Required variables not set. Need either route53_hosted_zone_id or route53_domain_name, plus dns_domain, cluster_name, api_vip, and ingress_vip"
+
+- name: Look up existing hosted zone by ID
+  amazon.aws.route53_zone_info:
+    query: hosted_zone
+    hosted_zone_id: "{{ route53_hosted_zone_id }}"
+  register: hosted_zone_lookup
+  when: route53_hosted_zone_id is defined
+
+- name: Verify hosted zone exists
+  assert:
+    that:
+      - hosted_zone_lookup.HostedZones | length > 0
+    fail_msg: "Hosted zone {{ route53_hosted_zone_id }} not found"
+  when: route53_hosted_zone_id is defined
+
+- name: Look up or create hosted zone by domain name
+  block:
+    - name: Check if hosted zone exists for domain
+      amazon.aws.route53_zone_info:
+        query: hosted_zone
+        dns_name: "{{ route53_domain_name | default(dns_domain) }}"
+      register: existing_zone_by_name
+
+    - name: Create hosted zone if it doesn't exist
+      amazon.aws.route53_zone:
+        zone: "{{ route53_domain_name | default(dns_domain) }}"
+        state: present
+        comment: "DNS zone for OpenShift cluster {{ cluster_name }}"
+      register: created_zone
+      when: existing_zone_by_name.HostedZones | length == 0
+
+    - name: Set zone info from existing or created zone
+      set_fact:
+        hosted_zone_by_name: "{{ existing_zone_by_name.HostedZones[0] if existing_zone_by_name.HostedZones | length > 0 else created_zone }}"
+  when: route53_hosted_zone_id is not defined
+
+- name: Set hosted zone ID fact
+  set_fact:
+    _route53_zone_id: "{{ hosted_zone_lookup.HostedZones[0].Id.split('/')[-1] if route53_hosted_zone_id is defined else (hosted_zone_by_name.Id.split('/')[-1] if 'Id' in hosted_zone_by_name else hosted_zone_by_name.zone_id) }}"
+    _route53_zone_name: "{{ hosted_zone_lookup.HostedZones[0].Name if route53_hosted_zone_id is defined else (hosted_zone_by_name.Name if 'Name' in hosted_zone_by_name else hosted_zone_by_name.zone.name) }}"
+    _route53_name_servers: "{{ hosted_zone_lookup.HostedZones[0].DelegationSet.NameServers if route53_hosted_zone_id is defined else (hosted_zone_by_name.DelegationSet.NameServers if 'DelegationSet' in hosted_zone_by_name else hosted_zone_by_name.zone.name_servers) }}"
+
+- name: Display Route53 zone information
+  debug:
+    msg:
+      - "Using Route53 hosted zone:"
+      - "  Zone ID: {{ _route53_zone_id }}"
+      - "  Zone Name: {{ _route53_zone_name }}"
+      - "  Cluster: {{ cluster_name }}"
+
+- name: Create API A record in Route53
+  amazon.aws.route53:
+    state: present
+    zone: "{{ _route53_zone_id }}"
+    record: "api.{{ cluster_name }}.{{ dns_domain }}"
+    type: A
+    ttl: "{{ route53_record_ttl }}"
+    value: "{{ api_vip }}"
+    wait: yes
+    overwrite: yes
+  register: api_record
+
+- name: Create wildcard apps A record in Route53
+  amazon.aws.route53:
+    state: present
+    zone: "{{ _route53_zone_id }}"
+    record: "*.apps.{{ cluster_name }}.{{ dns_domain }}"
+    type: A
+    ttl: "{{ route53_record_ttl }}"
+    value: "{{ ingress_vip }}"
+    wait: yes
+    overwrite: yes
+  register: apps_record
+
+- name: Wait for DNS propagation
+  pause:
+    seconds: "{{ route53_propagation_wait }}"
+  when: route53_wait_for_propagation | bool
+
+- name: Test DNS resolution for API record
+  command: dig +short api.{{ cluster_name }}.{{ dns_domain }}
+  register: dns_test_api
+  retries: 5
+  delay: 10
+  until: dns_test_api.stdout is search(api_vip)
+  when: route53_verify_dns | bool
+  ignore_errors: yes
+  changed_when: false
+
+- name: Test DNS resolution for apps record
+  command: dig +short test.apps.{{ cluster_name }}.{{ dns_domain }}
+  register: dns_test_apps
+  retries: 5
+  delay: 10
+  until: dns_test_apps.stdout is search(ingress_vip)
+  when: route53_verify_dns | bool
+  ignore_errors: yes
+  changed_when: false
+
+- name: Display Route53 configuration summary
+  debug:
+    msg:
+      - "=========================================="
+      - "Route53 DNS Configuration Complete!"
+      - "=========================================="
+      - ""
+      - "Hosted Zone ID: {{ _route53_zone_id }}"
+      - "Zone Name: {{ _route53_zone_name }}"
+      - "Cluster: {{ cluster_name }}"
+      - ""
+      - "DNS Records Created:"
+      - "  api.{{ cluster_name }}.{{ dns_domain }} → {{ api_vip }}"
+      - "  *.apps.{{ cluster_name }}.{{ dns_domain }} → {{ ingress_vip }}"
+      - ""
+      - "Name Servers (update your domain registrar if this is a new zone):"
+      - "{{ _route53_name_servers | to_nice_yaml }}"
+      - ""
+      - "Test DNS resolution:"
+      - "  dig api.{{ cluster_name }}.{{ dns_domain }}"
+      - "  dig console.apps.{{ cluster_name }}.{{ dns_domain }}"
+      - ""
+      - "Note: DNS propagation may take up to 60 seconds"
+      - "=========================================="

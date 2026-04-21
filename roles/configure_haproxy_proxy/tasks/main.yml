@@ -1,0 +1,135 @@
+---
+- name: Install HAProxy
+  ansible.builtin.dnf:
+    name:
+      - haproxy
+    state: present
+
+- name: Check if OpenShift cluster is installed
+  ansible.builtin.stat:
+    path: "{{ openshift_install_dir | default('~/openshift-install') }}/auth/kubeconfig"
+  register: kubeconfig_stat
+
+- name: Fail if kubeconfig not found
+  ansible.builtin.fail:
+    msg: |
+      OpenShift cluster not found. Please install OpenShift first.
+      Expected kubeconfig at: {{ openshift_install_dir | default('~/openshift-install') }}/auth/kubeconfig
+  when: not kubeconfig_stat.stat.exists
+
+- name: Set kubeconfig path
+  set_fact:
+    kubeconfig_path: "{{ openshift_install_dir | default('~/openshift-install') }}/auth/kubeconfig"
+
+- name: Get OpenShift API VIP from cluster
+  ansible.builtin.shell: |
+    export KUBECONFIG={{ kubeconfig_path }}
+    oc get infrastructure cluster -o jsonpath='{.status.apiServerInternalURL}' | sed 's|https://api\..*:\([0-9]*\)|https://\1|' | sed 's|https://||' | cut -d: -f1
+  register: api_vip_result
+  changed_when: false
+  failed_when: api_vip_result.rc != 0 or api_vip_result.stdout == ""
+
+- name: Get OpenShift ingress VIP from cluster
+  ansible.builtin.shell: |
+    export KUBECONFIG={{ kubeconfig_path }}
+    oc get service router-default -n openshift-ingress -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || \
+    oc get service router-default -n openshift-ingress -o jsonpath='{.spec.clusterIP}' 2>/dev/null || \
+    grep -A10 'ingressVIPs:' {{ openshift_install_dir | default('~/openshift-install') }}/install-config.yaml | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1
+  register: ingress_vip_result
+  changed_when: false
+  failed_when: ingress_vip_result.rc != 0 or ingress_vip_result.stdout == ""
+
+- name: Set discovered VIP facts
+  set_fact:
+    openshift_api_ip: "{{ api_vip_result.stdout }}"
+    openshift_ingress_ip: "{{ ingress_vip_result.stdout }}"
+
+- name: Display discovered VIPs
+  debug:
+    msg:
+      - "Discovered OpenShift VIPs from running cluster:"
+      - "  API VIP: {{ openshift_api_ip }}"
+      - "  Ingress VIP: {{ openshift_ingress_ip }}"
+
+- name: Configure SELinux to allow HAProxy to connect to any port
+  ansible.posix.seboolean:
+    name: haproxy_connect_any
+    state: yes
+    persistent: yes
+
+- name: Create HAProxy configuration for OpenShift passthrough
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: /etc/haproxy/haproxy.cfg
+    owner: root
+    group: root
+    mode: '0644'
+    validate: haproxy -f %s -c
+  notify: restart haproxy
+
+- name: Configure firewall for OpenShift API (6443)
+  ansible.posix.firewalld:
+    port: 6443/tcp
+    permanent: yes
+    state: enabled
+    zone: public
+  notify: reload firewalld
+
+- name: Configure firewall for HTTP (80)
+  ansible.posix.firewalld:
+    service: http
+    permanent: yes
+    state: enabled
+    zone: public
+  notify: reload firewalld
+
+- name: Configure firewall for HTTPS (443)
+  ansible.posix.firewalld:
+    service: https
+    permanent: yes
+    state: enabled
+    zone: public
+  notify: reload firewalld
+
+- name: Configure firewall for HAProxy stats (9000)
+  ansible.posix.firewalld:
+    port: 9000/tcp
+    permanent: yes
+    state: enabled
+    zone: public
+  notify: reload firewalld
+  when: haproxy_stats_enabled | default(true)
+
+- name: Start and enable HAProxy service
+  ansible.builtin.systemd:
+    name: haproxy
+    state: started
+    enabled: true
+
+- name: Wait for HAProxy to be ready
+  ansible.builtin.wait_for:
+    port: 6443
+    delay: 2
+    timeout: 30
+
+- name: Display HAProxy configuration summary
+  debug:
+    msg:
+      - "=========================================="
+      - "HAProxy Reverse Proxy Configuration Complete!"
+      - "=========================================="
+      - ""
+      - "External Access (via EC2 Public IP):"
+      - "  API (6443): {{ ansible_default_ipv4.address }}:6443 → {{ openshift_api_ip }}:6443"
+      - "  HTTPS (443): {{ ansible_default_ipv4.address }}:443 → {{ openshift_ingress_ip }}:443"
+      - "  HTTP (80): {{ ansible_default_ipv4.address }}:80 → {{ openshift_ingress_ip }}:80"
+      - ""
+      - "HAProxy Stats (optional):"
+      - "  http://{{ ansible_default_ipv4.address }}:9000/stats"
+      - "  Username: admin"
+      - "  Password: {{ haproxy_stats_password | default('admin') }}"
+      - ""
+      - "Test connectivity:"
+      - "  curl -k https://{{ ansible_default_ipv4.address }}:6443/healthz"
+      - "  curl http://{{ ansible_default_ipv4.address }}"
+      - "=========================================="

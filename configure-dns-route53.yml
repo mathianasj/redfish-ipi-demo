@@ -1,0 +1,135 @@
+---
+# Configure DNS using AWS Route53
+# This playbook sets up DNS records in Route53 for OpenShift deployment
+# Use this as an alternative to the bind-based DNS setup
+#
+# IMPORTANT: When using route53_hosted_zone_id, the DNS domain is automatically
+# discovered from the Route53 zone - no need to specify dns_domain!
+#
+# Usage examples:
+#
+# 1. Using existing hosted zone (domain auto-discovered):
+#    ansible-playbook configure-dns-route53.yml \
+#      -e route53_hosted_zone_id=Z1234567890ABC \
+#      -e api_vip=192.168.122.10 \
+#      -e ingress_vip=192.168.122.11
+#
+# 2. Create new zone with specific domain:
+#    ansible-playbook configure-dns-route53.yml \
+#      -e route53_domain_name=mydomain.com \
+#      -e api_vip=192.168.122.10 \
+#      -e ingress_vip=192.168.122.11
+
+- name: Configure DNS with Route53 for OpenShift
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    # DNS configuration
+    # dns_domain will be derived from Route53 zone if route53_hosted_zone_id is provided
+    # Otherwise, you can specify it manually
+    cluster_name: sno
+    api_vip: 192.168.122.10
+    ingress_vip: 192.168.122.11
+
+    # Route53 configuration
+    # Option 1: Use existing hosted zone (recommended)
+    # route53_hosted_zone_id: Z1234567890ABC
+
+    # Option 2: Use domain name (will create hosted zone if needed)
+    # route53_domain_name: mydomain.com
+
+    # Route53 settings
+    route53_record_ttl: 300
+    route53_wait_for_propagation: true
+    route53_propagation_wait: 30
+    route53_verify_dns: false
+
+    # AWS region
+    aws_region: us-east-1
+
+  pre_tasks:
+    - name: Validate configuration
+      assert:
+        that:
+          - route53_hosted_zone_id is defined or route53_domain_name is defined or dns_domain is defined
+        fail_msg: "Must specify either route53_hosted_zone_id, route53_domain_name, or dns_domain"
+
+    - name: Look up Route53 hosted zone to get domain
+      amazon.aws.route53_zone_info:
+        query: hosted_zone
+        hosted_zone_id: "{{ route53_hosted_zone_id }}"
+      register: route53_zone_lookup
+      when:
+        - route53_hosted_zone_id is defined
+        - dns_domain is not defined
+
+    - name: Set dns_domain from Route53 zone lookup
+      set_fact:
+        dns_domain: "{{ route53_zone_lookup.HostedZones[0].Name.rstrip('.') }}"
+      when:
+        - route53_hosted_zone_id is defined
+        - dns_domain is not defined
+        - route53_zone_lookup.HostedZones | length > 0
+
+    - name: Set dns_domain from route53_domain_name if not already set
+      set_fact:
+        dns_domain: "{{ route53_domain_name }}"
+      when:
+        - dns_domain is not defined
+        - route53_domain_name is defined
+
+    - name: Set route53_domain_name from dns_domain for role
+      set_fact:
+        route53_domain_name: "{{ dns_domain }}"
+      when:
+        - route53_domain_name is not defined
+        - route53_hosted_zone_id is not defined
+
+    - name: Check AWS credentials
+      amazon.aws.aws_caller_info:
+        region: "{{ aws_region }}"
+      register: aws_caller
+
+    - name: Display AWS account and DNS configuration
+      debug:
+        msg:
+          - "AWS Account ID: {{ aws_caller.account }}"
+          - "AWS User/Role: {{ aws_caller.arn }}"
+          - "Region: {{ aws_region }}"
+          - ""
+          - "DNS Configuration:"
+          - "  Domain: {{ dns_domain }}"
+          - "  Cluster: {{ cluster_name }}"
+          - "  {% if route53_hosted_zone_id is defined %}Route53 Zone ID: {{ route53_hosted_zone_id }}{% endif %}"
+
+  roles:
+    - role: configure_dns_route53
+      vars:
+        dns_domain: "{{ dns_domain }}"
+        cluster_name: "{{ cluster_name }}"
+        api_vip: "{{ api_vip }}"
+        ingress_vip: "{{ ingress_vip }}"
+
+  post_tasks:
+    - name: Display next steps
+      debug:
+        msg:
+          - ""
+          - "=========================================="
+          - "Next Steps:"
+          - "=========================================="
+          - ""
+          - "1. If you created a new hosted zone, update your domain registrar"
+          - "   with the Route53 name servers shown above"
+          - ""
+          - "2. Verify DNS resolution (may take up to 60 seconds):"
+          - "   dig api.{{ cluster_name }}.{{ dns_domain }}"
+          - "   dig console.apps.{{ cluster_name }}.{{ dns_domain }}"
+          - ""
+          - "3. Update your install-config.yaml if using these DNS names"
+          - ""
+          - "4. For private IPs (192.168.x.x), ensure your VMs can reach"
+          - "   these IPs or use bind for internal DNS instead"
+          - ""
+          - "=========================================="

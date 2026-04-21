@@ -1,0 +1,78 @@
+---
+# Configure HAProxy Reverse Proxy for OpenShift
+# This playbook sets up HAProxy to proxy external traffic to internal OpenShift VIPs
+
+- name: Find EC2 instance
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    aws_region: us-east-2
+    instance_name: nested-virt-host
+    ssh_private_key_path: "~/.ssh/id_rsa_fips"
+
+  tasks:
+    - name: Find EC2 instance by name
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+          "instance-state-name": ["running"]
+      register: instance_info
+
+    - name: Verify instance exists
+      fail:
+        msg: "No running EC2 instance found with name '{{ instance_name }}' in region {{ aws_region }}"
+      when: instance_info.instances | length == 0
+
+    - name: Add EC2 instance to inventory
+      add_host:
+        hostname: "{{ instance_info.instances[0].public_ip_address }}"
+        groupname: nested_virt_hosts
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: "{{ ssh_private_key_path }}"
+        ec2_public_ip: "{{ instance_info.instances[0].public_ip_address }}"
+
+    - name: Display instance information
+      debug:
+        msg:
+          - "Found EC2 instance: {{ instance_name }}"
+          - "Public IP: {{ instance_info.instances[0].public_ip_address }}"
+          - "Instance ID: {{ instance_info.instances[0].instance_id }}"
+
+- name: Configure HAProxy reverse proxy
+  hosts: nested_virt_hosts
+  become: true
+  gather_facts: true
+  vars:
+    openshift_install_dir: "~/openshift-install"
+    haproxy_stats_password: admin
+
+  roles:
+    - role: configure_haproxy_proxy
+      vars:
+        openshift_install_dir: "{{ openshift_install_dir }}"
+        haproxy_stats_password: "{{ haproxy_stats_password }}"
+
+  post_tasks:
+    - name: Display next steps
+      debug:
+        msg:
+          - ""
+          - "=========================================="
+          - "Next Steps:"
+          - "=========================================="
+          - ""
+          - "1. Test HAProxy from external machine:"
+          - "   curl -k https://{{ ec2_public_ip }}:6443/healthz"
+          - "   curl http://{{ ec2_public_ip }}"
+          - ""
+          - "2. View HAProxy stats:"
+          - "   http://{{ ec2_public_ip }}:9000/stats"
+          - ""
+          - "3. Configure Route53 external DNS (if needed):"
+          - "   ansible-playbook configure-dns-route53.yml \\"
+          - "     -e api_vip={{ ec2_public_ip }} \\"
+          - "     -e ingress_vip={{ ec2_public_ip }}"
+          - ""
+          - "=========================================="

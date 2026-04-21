@@ -43,12 +43,63 @@
   gather_facts: true
 
   pre_tasks:
+    - name: Check if virbr0-keepalive VM exists
+      ansible.builtin.shell: virsh list --all --name | grep -E "^virbr0-keepalive$" || echo ""
+      register: keepalive_vm_exists
+      changed_when: false
+
+    - name: Check if virbr0-keepalive VM is running
+      ansible.builtin.shell: virsh list --name | grep -E "^virbr0-keepalive$" || echo ""
+      register: keepalive_vm_running
+      changed_when: false
+      when: keepalive_vm_exists.stdout != ""
+
+    - name: Start virbr0-keepalive VM if not running
+      ansible.builtin.shell: virsh start virbr0-keepalive
+      when:
+        - keepalive_vm_exists.stdout != ""
+        - keepalive_vm_running.stdout == ""
+
+    - name: Ensure virbr0-keepalive VM is set to autostart
+      ansible.builtin.shell: virsh autostart virbr0-keepalive
+      when: keepalive_vm_exists.stdout != ""
+      ignore_errors: true
+
+    - name: Wait for virbr0 to come up
+      ansible.builtin.pause:
+        seconds: 3
+      when:
+        - keepalive_vm_exists.stdout != ""
+        - keepalive_vm_running.stdout == ""
+
+    - name: Verify virbr0 is UP
+      ansible.builtin.shell: ip link show virbr0 | grep -q "state UP" && echo "UP" || echo "DOWN"
+      register: virbr0_state
+      changed_when: false
+
+    - name: Fail if virbr0 is not UP
+      fail:
+        msg: |
+          virbr0 interface is not UP!
+
+          The virbr0 network is required for OpenShift installation.
+
+          Current state: {{ virbr0_state.stdout }}
+
+          Troubleshooting:
+          1. Check if virbr0-keepalive VM is running: sudo virsh list
+          2. Start it if needed: sudo virsh start virbr0-keepalive
+          3. Check network status: ip link show virbr0
+      when: virbr0_state.stdout != "UP"
+
     - name: Display workflow overview
       debug:
         msg:
           - "=========================================="
           - "OpenShift Complete Installation Workflow"
           - "=========================================="
+          - ""
+          - "✓ virbr0 network is UP and ready"
           - ""
           - "Phase 1: Preparation (5-10 minutes)"
           - "  - Configure DNS records"

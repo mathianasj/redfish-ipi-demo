@@ -1369,13 +1369,29 @@
           --noreboot
       when: dummy_vm_exists.stdout == ""
 
-    - name: Start dummy VM
-      ansible.builtin.shell: virsh start virbr0-keepalive 2>&1 || true
+    - name: Check if dummy VM is already running
+      ansible.builtin.shell: virsh list --name | grep -E "^virbr0-keepalive$" || echo ""
+      register: dummy_vm_running
       changed_when: false
 
-    - name: Set dummy VM to autostart
+    - name: Start dummy VM
+      ansible.builtin.shell: virsh start virbr0-keepalive
+      when: dummy_vm_running.stdout == ""
+
+    - name: Set dummy VM to autostart on boot
       ansible.builtin.shell: virsh autostart virbr0-keepalive
-      ignore_errors: true
+      register: autostart_result
+      changed_when: "'Domain virbr0-keepalive marked as autostarted' in autostart_result.stdout or 'already marked' in autostart_result.stderr"
+      failed_when: false
+
+    - name: Verify autostart is enabled
+      ansible.builtin.shell: virsh dominfo virbr0-keepalive | grep "Autostart:" | awk '{print $2}'
+      register: autostart_check
+      changed_when: false
+
+    - name: Display autostart status
+      debug:
+        msg: "✓ virbr0-keepalive VM autostart: {{ autostart_check.stdout }}"
 
     - name: Wait for virbr0 to get carrier from VM
       ansible.builtin.pause:

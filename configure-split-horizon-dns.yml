@@ -1,0 +1,294 @@
+---
+# Complete Split-Horizon DNS Setup for OpenShift
+# This playbook configures:
+# 1. Internal Bind DNS (for VMs) → Private OpenShift VIPs
+# 2. HAProxy reverse proxy → Proxies EC2 public IP to private VIPs
+# 3. Prepares for External Route53 DNS (for internet) → EC2 Public IP
+#
+# IMPORTANT: Provide route53_hosted_zone_id - the DNS domain will be automatically
+# discovered from the Route53 hosted zone (no need to specify dns_domain!)
+#
+# Usage:
+#   ansible-playbook configure-split-horizon-dns.yml \
+#     -e route53_hosted_zone_id=Z1234567890ABC
+#
+# The playbook will:
+# - Look up your Route53 zone and get the domain (e.g., mydomain.com)
+# - Discover OpenShift VIPs from the running cluster
+# - Configure Bind DNS with the discovered domain and VIPs
+# - Configure HAProxy to proxy EC2 public IP to OpenShift VIPs
+
+- name: Find EC2 instance and Route53 zone
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    aws_region: us-east-2
+    instance_name: nested-virt-host
+    ssh_private_key_path: "~/.ssh/id_rsa_fips"
+    # route53_hosted_zone_id: Z1234567890ABC  # Optional: specify zone ID
+    # dns_domain: example.com  # Optional: override domain from zone
+
+  tasks:
+    - name: Validate Route53 zone configuration
+      assert:
+        that:
+          - route53_hosted_zone_id is defined or dns_domain is defined
+        fail_msg: "Either route53_hosted_zone_id or dns_domain must be specified"
+
+    - name: Look up Route53 hosted zone
+      amazon.aws.route53_zone_info:
+        query: hosted_zone
+        hosted_zone_id: "{{ route53_hosted_zone_id }}"
+      register: route53_zone_lookup
+      when: route53_hosted_zone_id is defined
+
+    - name: Set DNS domain from Route53 zone
+      set_fact:
+        dns_domain: "{{ route53_zone_lookup.HostedZones[0].Name.rstrip('.') }}"
+      when:
+        - route53_hosted_zone_id is defined
+        - dns_domain is not defined
+
+    - name: Display Route53 zone information
+      debug:
+        msg:
+          - "Route53 Hosted Zone:"
+          - "  Zone ID: {{ route53_hosted_zone_id | default('Not specified') }}"
+          - "  DNS Domain: {{ dns_domain }}"
+      when: route53_hosted_zone_id is defined
+
+    - name: Find EC2 instance by name
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+          "instance-state-name": ["running"]
+      register: instance_info
+
+    - name: Verify instance exists
+      fail:
+        msg: "No running EC2 instance found with name '{{ instance_name }}' in region {{ aws_region }}"
+      when: instance_info.instances | length == 0
+
+    - name: Add EC2 instance to inventory
+      add_host:
+        hostname: "{{ instance_info.instances[0].public_ip_address }}"
+        groupname: nested_virt_hosts
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: "{{ ssh_private_key_path }}"
+        ec2_public_ip: "{{ instance_info.instances[0].public_ip_address }}"
+        dns_domain: "{{ dns_domain }}"
+        route53_zone_id: "{{ route53_hosted_zone_id | default('') }}"
+
+    - name: Display instance information
+      debug:
+        msg:
+          - "Found EC2 instance: {{ instance_name }}"
+          - "Public IP: {{ instance_info.instances[0].public_ip_address }}"
+          - "Instance ID: {{ instance_info.instances[0].instance_id }}"
+          - "DNS Domain: {{ dns_domain }}"
+
+- name: Configure Internal Bind DNS and HAProxy Proxy
+  hosts: nested_virt_hosts
+  become: true
+  gather_facts: true
+  vars:
+    # dns_domain is passed from previous play
+    cluster_name: sno
+    openshift_install_dir: "~/openshift-install"
+
+    # HAProxy stats
+    haproxy_stats_password: admin
+
+  tasks:
+    - name: Check if OpenShift cluster is installed
+      ansible.builtin.stat:
+        path: "{{ openshift_install_dir }}/auth/kubeconfig"
+      register: kubeconfig_check
+      become: false
+
+    - name: Fail if OpenShift not installed
+      fail:
+        msg: |
+          OpenShift cluster must be installed first!
+          Run: ansible-playbook prepare-and-install-openshift.yml
+      when: not kubeconfig_check.stat.exists
+
+    - name: Discover OpenShift API VIP
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ openshift_install_dir }}/auth/kubeconfig
+        oc get infrastructure cluster -o jsonpath='{.status.apiServerInternalURL}' | sed 's|https://api\..*:\([0-9]*\)|https://\1|' | sed 's|https://||' | cut -d: -f1
+      register: discovered_api_vip
+      become: false
+      changed_when: false
+
+    - name: Discover OpenShift Ingress VIP
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ openshift_install_dir }}/auth/kubeconfig
+        oc get service router-default -n openshift-ingress -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || \
+        oc get service router-default -n openshift-ingress -o jsonpath='{.spec.clusterIP}' 2>/dev/null || \
+        grep -A10 'ingressVIPs:' {{ openshift_install_dir }}/install-config.yaml | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1
+      register: discovered_ingress_vip
+      become: false
+      changed_when: false
+
+    - name: Display discovered VIPs
+      debug:
+        msg:
+          - "=========================================="
+          - "Discovered OpenShift VIPs:"
+          - "  API VIP: {{ discovered_api_vip.stdout }}"
+          - "  Ingress VIP: {{ discovered_ingress_vip.stdout }}"
+          - "=========================================="
+
+    - name: Set VIP facts
+      set_fact:
+        api_vip: "{{ discovered_api_vip.stdout }}"
+        ingress_vip: "{{ discovered_ingress_vip.stdout }}"
+
+  roles:
+    - role: configure_dns
+      vars:
+        dns_domain: "{{ dns_domain }}"
+        api_vip: "{{ api_vip }}"
+        ingress_vip: "{{ ingress_vip }}"
+
+    - role: configure_haproxy_proxy
+      vars:
+        openshift_install_dir: "{{ openshift_install_dir }}"
+
+  post_tasks:
+    - name: Display internal DNS configuration
+      debug:
+        msg:
+          - "=========================================="
+          - "Internal Bind DNS Configuration Complete!"
+          - "=========================================="
+          - ""
+          - "DNS Domain: {{ dns_domain }}"
+          - "Cluster Name: {{ cluster_name }}"
+          - ""
+          - "Internal DNS Records (for VMs):"
+          - "  api.{{ cluster_name }}.{{ dns_domain }} → {{ api_vip }}"
+          - "  *.apps.{{ cluster_name }}.{{ dns_domain }} → {{ ingress_vip }}"
+          - ""
+          - "HAProxy Reverse Proxy:"
+          - "  {{ ansible_default_ipv4.address }}:6443 → {{ api_vip }}:6443"
+          - "  {{ ansible_default_ipv4.address }}:443 → {{ ingress_vip }}:443"
+          - "  {{ ansible_default_ipv4.address }}:80 → {{ ingress_vip }}:80"
+          - ""
+          - "HAProxy Stats: http://{{ ansible_default_ipv4.address }}:9000/stats"
+          - "=========================================="
+
+    - name: Save configuration summary
+      ansible.builtin.copy:
+        content: |
+          Split-Horizon DNS Configuration Summary
+          ========================================
+
+          Date: {{ ansible_date_time.iso8601 }}
+
+          EC2 Instance:
+            Public IP: {{ ec2_public_ip }}
+            Private IP: {{ ansible_default_ipv4.address }}
+
+          OpenShift VIPs (Discovered):
+            API VIP: {{ api_vip }}
+            Ingress VIP: {{ ingress_vip }}
+
+          Internal DNS (Bind):
+            Domain: {{ dns_domain }}
+            Cluster: {{ cluster_name }}
+            DNS Server: {{ ansible_default_ipv4.address }}
+
+            Records:
+              api.{{ cluster_name }}.{{ dns_domain }} → {{ api_vip }}
+              *.apps.{{ cluster_name }}.{{ dns_domain }} → {{ ingress_vip }}
+
+          HAProxy Reverse Proxy:
+            External → Internal
+            {{ ec2_public_ip }}:6443 → {{ api_vip }}:6443
+            {{ ec2_public_ip }}:443 → {{ ingress_vip }}:443
+            {{ ec2_public_ip }}:80 → {{ ingress_vip }}:80
+
+            Stats: http://{{ ec2_public_ip }}:9000/stats
+
+          Next Steps:
+          -----------
+
+          1. Configure Route53 external DNS:
+          {% if route53_zone_id %}
+
+             ansible-playbook configure-dns-route53.yml \
+               -e route53_hosted_zone_id={{ route53_zone_id }} \
+               -e cluster_name={{ cluster_name }} \
+               -e api_vip={{ ec2_public_ip }} \
+               -e ingress_vip={{ ec2_public_ip }}
+
+             Or use the helper script:
+               ./configure-route53-external.sh {{ route53_zone_id }}
+          {% else %}
+
+             ansible-playbook configure-dns-route53.yml \
+               -e route53_hosted_zone_id=YOUR_ZONE_ID \
+               -e cluster_name={{ cluster_name }} \
+               -e api_vip={{ ec2_public_ip }} \
+               -e ingress_vip={{ ec2_public_ip }}
+          {% endif %}
+
+          2. Test internal access (from VMs):
+             dig api.{{ cluster_name }}.{{ dns_domain }}
+             curl -k https://api.{{ cluster_name }}.{{ dns_domain }}:6443/healthz
+
+          3. Test external access (from internet):
+             curl -k https://{{ ec2_public_ip }}:6443/healthz
+             curl http://{{ ec2_public_ip }}
+
+          4. Update your kubeconfig for external access:
+             Replace server URL with: https://api.{{ cluster_name }}.{{ dns_domain }}:6443
+        dest: "~/split-horizon-dns-config.txt"
+        mode: '0644'
+      become: false
+
+- name: Display final summary and next steps
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Set summary variables
+      set_fact:
+        _dns_domain: "{{ hostvars[groups['nested_virt_hosts'][0]].dns_domain }}"
+        _route53_zone_id: "{{ hostvars[groups['nested_virt_hosts'][0]].route53_zone_id }}"
+        _ec2_public_ip: "{{ hostvars[groups['nested_virt_hosts'][0]].ec2_public_ip }}"
+
+    - name: Final summary
+      debug:
+        msg:
+          - ""
+          - "=========================================="
+          - "Split-Horizon DNS Setup Complete!"
+          - "=========================================="
+          - ""
+          - "✅ Internal Bind DNS configured for {{ _dns_domain }}"
+          - "✅ HAProxy reverse proxy configured"
+          - "✅ Configuration saved to ~/split-horizon-dns-config.txt on EC2"
+          - ""
+          - "📋 Next Step: Configure Route53 External DNS"
+          - ""
+          - "{% if _route53_zone_id %}Run this command:"
+          - ""
+          - "  ./configure-route53-external.sh {{ _route53_zone_id }}"
+          - ""
+          - "Or manually:"
+          - ""
+          - "  ansible-playbook configure-dns-route53.yml \\"
+          - "    -e route53_hosted_zone_id={{ _route53_zone_id }} \\"
+          - "    -e cluster_name=sno \\"
+          - "    -e api_vip={{ _ec2_public_ip }} \\"
+          - "    -e ingress_vip={{ _ec2_public_ip }}"
+          - "{% else %}Run this command (get your Zone ID from: aws route53 list-hosted-zones):"
+          - ""
+          - "  ./configure-route53-external.sh YOUR_ZONE_ID"
+          - "{% endif %}"
+          - ""
+          - "=========================================="

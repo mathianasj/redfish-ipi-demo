@@ -1,8 +1,18 @@
 ---
+# DNS provider: 'bind' or 'route53'
+dns_provider: bind
+
 # DNS domain configuration
 dns_domain: example.com
 
-# DNS forwarders
+# DNS forwarders (for bind only)
 dns_forwarders:
   - 8.8.8.8
   - 8.8.4.4
+
+# Route53 configuration (when dns_provider is 'route53')
+# route53_hosted_zone_id: Z1234567890ABC  # Optional: use existing zone
+# route53_domain_name: example.com        # Optional: create new zone
+route53_record_ttl: 300
+route53_wait_for_propagation: true
+route53_propagation_wait: 30

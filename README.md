@@ -180,6 +180,76 @@ Features:
 - SSH enabled
 - Persistent configuration
 
+### Configure DNS
+
+You have three options for DNS configuration:
+
+#### Option 1: Split-Horizon DNS (Recommended for Production)
+
+```bash
+# Complete setup: Internal Bind + HAProxy (discovers domain from Route53)
+ansible-playbook configure-split-horizon-dns.yml \
+  -e route53_hosted_zone_id=Z1234567890ABC
+```
+
+**Then configure Route53 external DNS:**
+```bash
+# Using helper script (automatically gets EC2 IP and domain from zone)
+./configure-route53-external.sh Z1234567890ABC
+
+# Or manually
+ansible-playbook configure-dns-route53.yml \
+  -e route53_hosted_zone_id=Z1234567890ABC \
+  -e api_vip=<EC2_PUBLIC_IP> \
+  -e ingress_vip=<EC2_PUBLIC_IP>
+```
+
+Features:
+- ✅ **Internal Bind DNS** → Private IPs for VMs (fast, direct access)
+- ✅ **HAProxy Reverse Proxy** → Proxies EC2 public IP to private VIPs
+- ✅ **External Route53 DNS** → Public IPs for internet users
+- ✅ **Auto-discovers VIPs** from running OpenShift cluster
+- ✅ **Auto-discovers domain** from Route53 hosted zone
+- Best for production with external access needs
+- See [Split-Horizon DNS Guide](docs/infrastructure/SPLIT_HORIZON_DNS.md)
+
+**Architecture:**
+- Internal VMs → Bind DNS → Direct to OpenShift (192.168.122.x)
+- External users → Route53 → HAProxy → OpenShift (via proxy)
+
+#### Option 2: Bind Only (Local DNS Server)
+
+```bash
+# Configure bind DNS on EC2 instance
+ansible-playbook configure-dns.yml
+```
+
+Features:
+- Local bind DNS server on EC2 instance
+- Automatic zone file configuration
+- API and ingress DNS records
+- DNS forwarders (8.8.8.8, 8.8.4.4)
+- Best for isolated lab/demo environments
+- See [DNS Setup Guide](docs/infrastructure/DNS_SETUP.md)
+
+#### Option 3: Route53 Only (AWS Managed DNS)
+
+```bash
+# Configure DNS using AWS Route53 (domain auto-discovered from zone)
+ansible-playbook configure-dns-route53.yml \
+  -e route53_hosted_zone_id=Z1234567890ABC \
+  -e api_vip=192.168.122.10 \
+  -e ingress_vip=192.168.122.11
+```
+
+Features:
+- Managed DNS without local server
+- Route53 hosted zone management
+- API and ingress DNS records
+- No dependencies on EC2 instance
+- Best for testing external DNS
+- See [Route53 DNS Setup Guide](docs/infrastructure/DNS_SETUP_ROUTE53.md)
+
 ### Scale Workers
 
 ```bash
@@ -357,7 +427,10 @@ For network isolation and advanced routing:
 - **[Instance Types](docs/infrastructure/INSTANCE_TYPES.md)** - AWS instance comparison and recommendations
 - **[RHEL Setup](docs/infrastructure/RHEL_SETUP.md)** - RHEL 9 configuration and preparation
 - **[Networking](docs/infrastructure/NETWORKING.md)** - Network architecture and configuration
-- **[DNS Setup](docs/infrastructure/DNS_SETUP.md)** - DNS configuration for OpenShift
+- **[Split-Horizon DNS](docs/infrastructure/SPLIT_HORIZON_DNS.md)** - Complete external + internal DNS setup (recommended)
+- **[DNS Comparison: Bind vs Route53](docs/infrastructure/DNS_COMPARISON.md)** - Choose the right DNS solution
+- **[DNS Setup (Bind)](docs/infrastructure/DNS_SETUP.md)** - Local DNS configuration for OpenShift
+- **[DNS Setup (Route53)](docs/infrastructure/DNS_SETUP_ROUTE53.md)** - AWS Route53 DNS configuration
 - **[Cleanup](docs/infrastructure/CLEANUP.md)** - Resource deletion and teardown
 - **[Instance Management](docs/infrastructure/INSTANCE-MANAGEMENT-README.md)** - EC2 instance lifecycle
 

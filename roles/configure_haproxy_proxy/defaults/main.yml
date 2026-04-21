@@ -1,0 +1,12 @@
+---
+# OpenShift installation directory (where kubeconfig is located)
+openshift_install_dir: "~/openshift-install"
+
+# HAProxy stats interface
+haproxy_stats_enabled: true
+haproxy_stats_user: admin
+haproxy_stats_password: admin
+haproxy_stats_port: 9000
+
+# Note: API and Ingress VIPs are automatically discovered from the running OpenShift cluster
+# They are NOT configurable as defaults - they are read from the cluster itself

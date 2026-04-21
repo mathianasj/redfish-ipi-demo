@@ -1,0 +1,192 @@
+---
+# Example configurations for Route53 DNS setup
+# Copy this file to configure-dns-route53.yml and customize for your environment
+
+# =============================================================================
+# Example 1: Use existing hosted zone with default VIPs
+# =============================================================================
+# ansible-playbook configure-dns-route53.yml
+
+# - name: Configure DNS with Route53 (existing zone)
+#   hosts: localhost
+#   gather_facts: false
+#   become: false
+#   vars:
+#     # Your existing Route53 hosted zone ID
+#     route53_hosted_zone_id: Z1234567890ABC
+#
+#     # DNS configuration (use your domain)
+#     dns_domain: example.com
+#     cluster_name: sno
+#
+#     # Default VIPs for libvirt network
+#     api_vip: 192.168.122.10
+#     ingress_vip: 192.168.122.11
+#
+#     # AWS region
+#     aws_region: us-east-1
+#
+#   pre_tasks:
+#     - name: Check AWS credentials
+#       amazon.aws.aws_caller_info:
+#         region: "{{ aws_region }}"
+#       register: aws_caller
+#
+#   roles:
+#     - role: configure_dns_route53
+
+# =============================================================================
+# Example 2: Create new hosted zone automatically
+# =============================================================================
+# ansible-playbook configure-dns-route53.yml
+
+# - name: Configure DNS with Route53 (create new zone)
+#   hosts: localhost
+#   gather_facts: false
+#   become: false
+#   vars:
+#     # Let Route53 create a new hosted zone
+#     route53_domain_name: mycompany.com
+#
+#     # DNS configuration
+#     dns_domain: mycompany.com
+#     cluster_name: prod
+#     api_vip: 192.168.122.10
+#     ingress_vip: 192.168.122.11
+#
+#     # AWS region
+#     aws_region: us-east-1
+#
+#   roles:
+#     - role: configure_dns_route53
+
+# =============================================================================
+# Example 3: Production setup with public IPs
+# =============================================================================
+# ansible-playbook configure-dns-route53.yml
+
+# - name: Configure DNS with Route53 (production with public IPs)
+#   hosts: localhost
+#   gather_facts: false
+#   become: false
+#   vars:
+#     # Existing hosted zone
+#     route53_hosted_zone_id: Z9876543210XYZ
+#
+#     # DNS configuration
+#     dns_domain: production.example.com
+#     cluster_name: ocp-prod
+#
+#     # Public IPs (Elastic IPs or public addresses)
+#     api_vip: 3.145.67.89
+#     ingress_vip: 3.145.67.90
+#
+#     # Production settings
+#     route53_record_ttl: 3600  # 1 hour for production
+#     route53_wait_for_propagation: true
+#     route53_verify_dns: true
+#
+#     aws_region: us-east-1
+#
+#   roles:
+#     - role: configure_dns_route53
+
+# =============================================================================
+# Example 4: Multiple clusters in same domain
+# =============================================================================
+# Run this playbook multiple times with different cluster names
+
+# Cluster 1: Dev
+# ansible-playbook configure-dns-route53.yml -e cluster_name=dev -e api_vip=192.168.122.10 -e ingress_vip=192.168.122.11
+
+# Cluster 2: Test
+# ansible-playbook configure-dns-route53.yml -e cluster_name=test -e api_vip=192.168.122.20 -e ingress_vip=192.168.122.21
+
+# Cluster 3: Prod
+# ansible-playbook configure-dns-route53.yml -e cluster_name=prod -e api_vip=192.168.122.30 -e ingress_vip=192.168.122.31
+
+# =============================================================================
+# Example 5: Fast DNS updates for testing
+# =============================================================================
+# ansible-playbook configure-dns-route53.yml
+
+# - name: Configure DNS with Route53 (fast updates for testing)
+#   hosts: localhost
+#   gather_facts: false
+#   become: false
+#   vars:
+#     route53_hosted_zone_id: Z1234567890ABC
+#     dns_domain: lab.example.com
+#     cluster_name: test
+#     api_vip: 192.168.122.10
+#     ingress_vip: 192.168.122.11
+#
+#     # Lower TTL for faster DNS updates during testing
+#     route53_record_ttl: 60  # 1 minute
+#     route53_propagation_wait: 10  # Don't wait as long
+#
+#     aws_region: us-east-1
+#
+#   roles:
+#     - role: configure_dns_route53
+
+# =============================================================================
+# Example 6: Split-horizon DNS (Route53 for external, Bind for internal)
+# =============================================================================
+
+# Step 1: Configure Bind for internal access (private IPs)
+# ansible-playbook configure-dns.yml
+
+# Step 2: Configure Route53 for external access (public IPs)
+# ansible-playbook configure-dns-route53.yml
+
+# - name: Configure Route53 for external access
+#   hosts: localhost
+#   gather_facts: false
+#   become: false
+#   vars:
+#     route53_hosted_zone_id: Z1234567890ABC
+#     dns_domain: example.com
+#     cluster_name: sno
+#
+#     # Public IPs for external access
+#     api_vip: 3.145.67.89
+#     ingress_vip: 3.145.67.90
+#
+#     aws_region: us-east-1
+#
+#   roles:
+#     - role: configure_dns_route53
+
+# Then:
+# - Internal VMs use Bind (192.168.122.1) → resolves to private IPs
+# - External users use Route53 (AWS) → resolves to public IPs
+
+# =============================================================================
+# Command Line Overrides
+# =============================================================================
+
+# Override any variable from command line:
+# ansible-playbook configure-dns-route53.yml \
+#   -e route53_hosted_zone_id=Z1234567890ABC \
+#   -e dns_domain=example.com \
+#   -e cluster_name=sno \
+#   -e api_vip=192.168.122.10 \
+#   -e ingress_vip=192.168.122.11 \
+#   -e route53_record_ttl=300 \
+#   -e aws_region=us-east-1
+
+# =============================================================================
+# AWS Credentials
+# =============================================================================
+
+# Option 1: Environment variables
+# export AWS_ACCESS_KEY_ID=your_access_key_id
+# export AWS_SECRET_ACCESS_KEY=your_secret_access_key
+# export AWS_REGION=us-east-1
+
+# Option 2: AWS CLI profile
+# export AWS_PROFILE=your_profile_name
+
+# Option 3: IAM role (if running on EC2)
+# No configuration needed - automatically uses EC2 instance role
