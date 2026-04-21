@@ -456,6 +456,278 @@ for bmc in 10.0.10.101 10.0.10.102 10.0.10.103; do
 done
 ```
 
+## Running the Installation
+
+Now that you have a complete install-config.yaml, follow these steps to install OpenShift.
+
+### Step 1: Create Installation Directory
+
+```bash
+# Create a directory for installation files
+mkdir ~/openshift-install-dir
+cd ~/openshift-install-dir
+```
+
+### Step 2: Place install-config.yaml
+
+```bash
+# Copy your install-config.yaml to the installation directory
+cp /path/to/install-config.yaml ~/openshift-install-dir/
+```
+
+### Step 3: Backup install-config.yaml
+
+**CRITICAL**: The installer consumes (deletes) the install-config.yaml file during installation!
+
+```bash
+# Always create a backup
+cp install-config.yaml install-config.yaml.backup
+```
+
+### Step 4: Download OpenShift Installer
+
+```bash
+# Download the installer for your version
+# Replace with the version matching your mirrored images
+VERSION=4.20.0
+
+# Download installer
+curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${VERSION}/openshift-install-linux.tar.gz
+
+# Extract
+tar -xzf openshift-install-linux.tar.gz
+
+# Make executable
+chmod +x openshift-install
+
+# Verify version
+./openshift-install version
+```
+
+### Step 5: Verify DNS is Configured
+
+**Before running the installer**, ensure DNS is working:
+
+```bash
+# Test API VIP resolution
+nslookup api.ocp.example.com
+# Should return: 10.0.10.5
+
+# Test wildcard apps resolution
+nslookup test.apps.ocp.example.com
+# Should return: 10.0.10.6
+
+# Test from the servers themselves (if accessible)
+ssh root@<server-ip> "nslookup api.ocp.example.com"
+```
+
+**If DNS is not configured**, you have two options:
+
+1. **Set up proper DNS** (recommended for production)
+2. **Use /etc/hosts** (testing only):
+   ```bash
+   # On your workstation and all servers
+   echo "10.0.10.5  api.ocp.example.com" >> /etc/hosts
+   echo "10.0.10.6  oauth-openshift.apps.ocp.example.com" >> /etc/hosts
+   echo "10.0.10.6  console-openshift-console.apps.ocp.example.com" >> /etc/hosts
+   ```
+
+### Step 6: Start the Installation
+
+```bash
+# Run the installer
+./openshift-install create cluster --dir=. --log-level=info
+
+# For more verbose output
+./openshift-install create cluster --dir=. --log-level=debug
+```
+
+**What happens next:**
+1. Installer validates install-config.yaml
+2. Generates manifests and ignition configs
+3. Creates temporary bootstrap VM
+4. Contacts BMCs via Redfish
+5. Powers off baremetal hosts
+6. Mounts RHCOS ISO via virtual media
+7. Powers on hosts
+8. Monitors bootstrap process
+
+### Step 7: Monitor Installation Progress
+
+**In the same terminal**, you'll see output like:
+
+```
+INFO Consuming Install Config from target directory
+INFO Obtaining RHCOS image file from 'https://...'
+INFO Creating infrastructure resources...
+INFO Waiting up to 20m0s for the Kubernetes API at https://api.ocp.example.com:6443...
+INFO API v1.29.0 up
+INFO Waiting up to 30m0s for bootstrapping to complete...
+INFO Destroying the bootstrap resources...
+INFO Waiting up to 40m0s for the cluster at https://api.ocp.example.com:6443 to initialize...
+INFO Waiting up to 10m0s for the openshift-console route to be created...
+INFO Install complete!
+```
+
+**In another terminal**, monitor BMC activity:
+
+```bash
+# Watch Redfish power states
+while true; do
+  echo "=== Power States at $(date) ==="
+  for bmc in 10.0.10.101 10.0.10.102 10.0.10.103; do
+    state=$(curl -sk -u admin:password https://$bmc/redfish/v1/Systems/System.Embedded.1 | jq -r '.PowerState')
+    echo "$bmc: $state"
+  done
+  sleep 30
+done
+```
+
+**Monitor via BMC console** (optional):
+- Access BMC web interface
+- Open virtual console (iKVM, HTML5 console)
+- Watch RHCOS boot and installation
+
+### Step 8: Installation Complete
+
+When installation finishes (typically 45-60 minutes), you'll see:
+
+```
+INFO Install complete!
+INFO To access the cluster as the system:admin user when using 'oc', run 'export KUBECONFIG=/root/openshift-install-dir/auth/kubeconfig'
+INFO Access the OpenShift web-console here: https://console-openshift-console.apps.ocp.example.com
+INFO Login to the console with user: "kubeadmin", and password: "xxxxx-xxxxx-xxxxx-xxxxx"
+```
+
+**Important files created:**
+```
+openshift-install-dir/
+├── auth/
+│   ├── kubeconfig          # Admin kubeconfig
+│   └── kubeadmin-password  # Web console password
+├── metadata.json           # Cluster metadata
+└── .openshift_install.log  # Full installation log
+```
+
+### Step 9: Export Kubeconfig
+
+```bash
+# Export kubeconfig for CLI access
+export KUBECONFIG=~/openshift-install-dir/auth/kubeconfig
+
+# Verify access
+oc whoami
+# Should show: system:admin
+
+# Check cluster version
+oc get clusterversion
+
+# Check nodes
+oc get nodes
+```
+
+**Expected output:**
+```
+NAME       STATUS   ROLES                  AGE   VERSION
+master-1   Ready    control-plane,master   45m   v1.29.0+xxxxx
+master-2   Ready    control-plane,master   45m   v1.29.0+xxxxx
+master-3   Ready    control-plane,master   45m   v1.29.0+xxxxx
+```
+
+### Step 10: Access Web Console
+
+**Get console URL and credentials:**
+
+```bash
+# Console URL
+echo "Console: https://console-openshift-console.apps.ocp.example.com"
+
+# Get kubeadmin password
+cat ~/openshift-install-dir/auth/kubeadmin-password
+```
+
+**Access the console:**
+
+1. Open browser to: `https://console-openshift-console.apps.ocp.example.com`
+2. Accept certificate warning (self-signed cert for apps wildcard)
+3. Click "kubeadmin" login
+4. Username: `kubeadmin`
+5. Password: (from kubeadmin-password file)
+
+**Alternative - Get password via CLI:**
+```bash
+# One-liner to open console with password
+PASSWORD=$(cat ~/openshift-install-dir/auth/kubeadmin-password)
+echo "Username: kubeadmin"
+echo "Password: $PASSWORD"
+echo "URL: https://console-openshift-console.apps.ocp.example.com"
+```
+
+### Step 11: Verify Cluster Health
+
+```bash
+# Check all nodes are ready
+oc get nodes
+
+# Check cluster operators
+oc get co
+# All should show AVAILABLE=True, PROGRESSING=False, DEGRADED=False
+
+# Check cluster version
+oc get clusterversion
+# Should show desired version and PROGRESSING=False
+
+# Check pods in critical namespaces
+oc get pods -n openshift-kube-apiserver
+oc get pods -n openshift-etcd
+oc get pods -n openshift-console
+```
+
+### Step 12: Create Regular Admin User (Optional)
+
+The `kubeadmin` user is temporary. Create a permanent admin:
+
+```bash
+# Create htpasswd file
+htpasswd -c -B -b users.htpasswd admin 'YourPassword123!'
+
+# Create secret
+oc create secret generic htpass-secret \
+  --from-file=htpasswd=users.htpasswd \
+  -n openshift-config
+
+# Create OAuth config
+cat <<EOF | oc apply -f -
+apiVersion: config.openshift.io/v1
+kind: OAuth
+metadata:
+  name: cluster
+spec:
+  identityProviders:
+  - name: htpasswd_provider
+    mappingMethod: claim
+    type: HTPasswd
+    htpasswd:
+      fileData:
+        name: htpass-secret
+EOF
+
+# Give admin user cluster-admin role
+oc adm policy add-cluster-role-to-user cluster-admin admin
+
+# Wait for authentication operator to reconcile
+oc get pods -n openshift-authentication -w
+# Wait for pods to restart
+
+# Test new user login
+oc login -u admin -p YourPassword123! https://api.ocp.example.com:6443
+```
+
+**Now you can delete kubeadmin:**
+```bash
+oc delete secrets kubeadmin -n kube-system
+```
+
 ## How OpenShift Uses Redfish
 
 ### Installation Flow
@@ -508,9 +780,29 @@ When you run `openshift-install create cluster`, here's what happens:
 
 ### Day 2: Adding Worker Nodes
 
-After installation, you can add worker nodes using BareMetalHost and MachineSet resources.
+After the initial cluster installation completes with 3 control plane nodes, you can add worker nodes to handle application workloads.
+
+**Prerequisites:**
+- Cluster installed and accessible
+- Additional physical servers with BMC/Redfish access
+- Kubeconfig exported: `export KUBECONFIG=~/openshift-install-dir/auth/kubeconfig`
+
+**Overview of the process:**
+1. Create BMC credential secrets for each worker
+2. Create BareMetalHost resources (registers servers with Metal3)
+3. Create/update MachineSet (triggers actual provisioning)
+4. Monitor as workers are provisioned and join cluster
+5. (Optional) Disable scheduling on control plane nodes
+
+**Time**: 15-30 minutes per worker (provisioning happens in parallel)
+
+Let's walk through adding 2 worker nodes.
 
 #### Step 1: Create BMC Credentials Secret
+
+For each worker, create a secret with BMC credentials:
+
+**Create worker-1-bmc-secret.yaml:**
 
 ```yaml
 apiVersion: v1
@@ -524,12 +816,40 @@ stringData:
   password: bmcpassword
 ```
 
+**Apply the secret:**
 ```bash
 oc apply -f worker-1-bmc-secret.yaml
 ```
 
-#### Step 2: Create BareMetalHost Resource
+**Repeat for worker-2:**
+```bash
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: worker-2-bmc-secret
+  namespace: openshift-machine-api
+type: Opaque
+stringData:
+  username: admin
+  password: bmcpassword
+EOF
+```
 
+**Verify secrets:**
+```bash
+oc get secrets -n openshift-machine-api | grep bmc-secret
+```
+
+#### Step 2: Create BareMetalHost Resources
+
+**Before creating BareMetalHost**, gather this information for each worker:
+- BMC IP address
+- Redfish System UUID (from `curl https://<bmc-ip>/redfish/v1/Systems`)
+- Boot MAC address (from server or BMC interface list)
+- Root device hint (disk to install to)
+
+**Create worker-1-bmh.yaml:**
 ```yaml
 apiVersion: metal3.io/v1alpha1
 kind: BareMetalHost
@@ -549,23 +869,67 @@ spec:
     deviceName: "/dev/sda"
 ```
 
+**Apply worker-1:**
 ```bash
 oc apply -f worker-1-bmh.yaml
 ```
 
-**Check BareMetalHost status:**
+**Create and apply worker-2:**
 ```bash
-oc get baremetalhosts -n openshift-machine-api
+cat <<EOF | oc apply -f -
+apiVersion: metal3.io/v1alpha1
+kind: BareMetalHost
+metadata:
+  name: worker-2
+  namespace: openshift-machine-api
+  labels:
+    infraenvs.agent-install.openshift.io: ""
+spec:
+  online: true
+  bmc:
+    address: redfish-virtualmedia://10.0.10.105/redfish/v1/Systems/System.Embedded.1
+    credentialsName: worker-2-bmc-secret
+    disableCertificateVerification: true
+  bootMACAddress: "d4:ae:52:44:55:66"
+  rootDeviceHints:
+    deviceName: "/dev/sda"
+EOF
 ```
 
-The host should go through these states:
-1. `registering` - BMC credentials validated
-2. `inspecting` - Hardware inventory gathered
-3. `available` - Ready to be provisioned
+**Check BareMetalHost status:**
+```bash
+# List all BareMetalHosts
+oc get baremetalhosts -n openshift-machine-api
+
+# Watch status changes
+oc get baremetalhosts -n openshift-machine-api -w
+
+# Get detailed info for a specific host
+oc describe baremetalhost worker-1 -n openshift-machine-api
+```
+
+**Expected progression:**
+```
+NAME       STATUS       PROVISIONING STATUS   CONSUMER   BMC                 HARDWARE PROFILE
+worker-1   OK           inspecting                       redfish-virtualmedia://...
+worker-2   OK           inspecting                       redfish-virtualmedia://...
+```
+
+After inspection completes (5-10 minutes):
+```
+NAME       STATUS       PROVISIONING STATUS   CONSUMER   BMC                 HARDWARE PROFILE
+worker-1   OK           available                        redfish-virtualmedia://...   unknown
+worker-2   OK           available                        redfish-virtualmedia://...   unknown
+```
+
+**Troubleshooting:**
+- If stuck in `registering`: Check BMC credentials and network connectivity
+- If stuck in `inspecting`: Check BMC virtual media support
+- If status shows errors: `oc describe baremetalhost worker-1 -n openshift-machine-api`
 
 #### Step 3: Create MachineSet to Provision Workers
 
-**Important**: Creating a BareMetalHost alone does NOT provision a worker. You must create a MachineSet that references the host.
+**CRITICAL**: Creating a BareMetalHost alone does NOT provision a worker. The BareMetalHost registers the hardware, but you need a MachineSet to actually provision and join workers to the cluster.
 
 ```yaml
 apiVersion: machine.openshift.io/v1beta1
@@ -598,81 +962,253 @@ spec:
             name: worker-user-data
 ```
 
-**Note**: The RHCOS image is automatically managed by the cluster's release payload and the Bare Metal Operator. You don't need to specify image URL or checksum.
+**Note**: The RHCOS image is automatically managed by the cluster's release payload. You don't need to specify image URL or checksum.
 
-**Get cluster ID:**
+**Step 3a: Get Your Cluster ID**
+
 ```bash
-oc get -o jsonpath='{.status.infrastructureName}{"\n"}' infrastructure cluster
+# Get cluster infrastructure name (used as cluster ID)
+CLUSTER_ID=$(oc get -o jsonpath='{.status.infrastructureName}{"\n"}' infrastructure cluster)
+echo "Cluster ID: $CLUSTER_ID"
+
+# Example output: ocp-gkw4z
 ```
 
-**Best practice - Use existing MachineSet as template:**
+**Step 3b: Create the MachineSet**
+
+Replace `<cluster-id>` in the YAML above with your actual cluster ID, or create it with sed:
+
 ```bash
-# Get existing worker MachineSet (if created during install)
-oc get machineset -n openshift-machine-api -o yaml > worker-machineset-template.yaml
+# Save the MachineSet template
+cat <<EOF > worker-machineset.yaml
+apiVersion: machine.openshift.io/v1beta1
+kind: MachineSet
+metadata:
+  name: worker
+  namespace: openshift-machine-api
+  labels:
+    machine.openshift.io/cluster-api-cluster: ${CLUSTER_ID}
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      machine.openshift.io/cluster-api-cluster: ${CLUSTER_ID}
+      machine.openshift.io/cluster-api-machineset: worker
+  template:
+    metadata:
+      labels:
+        machine.openshift.io/cluster-api-cluster: ${CLUSTER_ID}
+        machine.openshift.io/cluster-api-machine-role: worker
+        machine.openshift.io/cluster-api-machine-type: worker
+        machine.openshift.io/cluster-api-machineset: worker
+    spec:
+      metadata: {}
+      providerSpec:
+        value:
+          apiVersion: machine.openshift.io/v1beta1
+          kind: BareMetalMachineProviderSpec
+          userData:
+            name: worker-user-data
+EOF
 
-# Or extract from a running cluster
-oc get machineset -n openshift-machine-api -o json | \
-  jq '.items[0]' | \
-  yq eval -P > worker-machineset-template.yaml
-
-# Edit and modify:
-# - Change metadata.name
-# - Update replicas count
-# - Ensure labels match your cluster
+# Review the file
+cat worker-machineset.yaml
 ```
 
-**Create MachineSet:**
+**Alternative - Use existing MachineSet as template (if available):**
+```bash
+# Check if any MachineSet already exists
+oc get machineset -n openshift-machine-api
+
+# If exists, use as template
+oc get machineset -n openshift-machine-api -o yaml | head -100 > worker-machineset-template.yaml
+# Edit template and apply
+```
+
+**Step 3c: Apply the MachineSet**
+
 ```bash
 oc apply -f worker-machineset.yaml
 ```
 
-**Monitor provisioning:**
+**Verify MachineSet created:**
 ```bash
-# Watch machines being created
+oc get machineset -n openshift-machine-api
+
+# Should show:
+# NAME     DESIRED   CURRENT   READY   AVAILABLE   AGE
+# worker   2         0         0       0           5s
+```
+
+#### Step 4: Monitor Worker Provisioning
+
+**Watch the entire provisioning process:**
+
+**Terminal 1 - Watch Machines:**
+```bash
 oc get machines -n openshift-machine-api -w
+```
 
-# Watch BareMetalHosts being provisioned
+**Terminal 2 - Watch BareMetalHosts:**
+```bash
 oc get baremetalhosts -n openshift-machine-api -w
+```
 
-# Watch nodes joining cluster
+**Terminal 3 - Watch Nodes:**
+```bash
 oc get nodes -w
 ```
 
-#### Step 4: Disable Control Plane Scheduling (Optional)
+**What you'll see:**
 
-Once you have workers, you can prevent workloads from scheduling on control plane nodes:
+1. **Machines created** (immediate):
+   ```
+   NAME                   PHASE      TYPE   REGION   ZONE   AGE
+   worker-xxxxx-yyyyy     Pending                            5s
+   worker-xxxxx-zzzzz     Pending                            5s
+   ```
 
+2. **BareMetalHosts claim** (30 seconds):
+   ```
+   NAME       STATUS   STATE          CONSUMER               BMC
+   worker-1   OK       provisioning   worker-xxxxx-yyyyy     redfish-virtualmedia://...
+   worker-2   OK       provisioning   worker-xxxxx-zzzzz     redfish-virtualmedia://...
+   ```
+
+3. **Provisioning starts** (1-2 minutes):
+   - Hosts power off
+   - ISO mounts via Redfish
+   - Hosts power on and boot RHCOS
+
+4. **Nodes appear** (10-15 minutes):
+   ```
+   NAME       STATUS     ROLES    AGE   VERSION
+   master-1   Ready      master   2h    v1.29.0
+   master-2   Ready      master   2h    v1.29.0
+   master-3   Ready      master   2h    v1.29.0
+   worker-1   NotReady   worker   30s   v1.29.0
+   worker-2   NotReady   worker   30s   v1.29.0
+   ```
+
+5. **Nodes become Ready** (5 minutes):
+   ```
+   worker-1   Ready      worker   5m    v1.29.0
+   worker-2   Ready      worker   5m    v1.29.0
+   ```
+
+**Check progress with single commands:**
 ```bash
-# Mark each master as unschedulable for regular workloads
-oc adm cordon master-1
-oc adm cordon master-2
-oc adm cordon master-3
+# Overview
+echo "=== MachineSet ===" && oc get machineset -n openshift-machine-api && \
+echo "=== Machines ===" && oc get machines -n openshift-machine-api && \
+echo "=== BareMetalHosts ===" && oc get baremetalhosts -n openshift-machine-api && \
+echo "=== Nodes ===" && oc get nodes
 
-# Or use a more surgical approach - remove worker role
-oc label node master-1 node-role.kubernetes.io/worker-
-oc label node master-2 node-role.kubernetes.io/worker-
-oc label node master-3 node-role.kubernetes.io/worker-
+# Detailed view of a specific BareMetalHost
+oc describe baremetalhost worker-1 -n openshift-machine-api
 
-# Add infra taint to prevent scheduling
-oc adm taint nodes master-1 node-role.kubernetes.io/master=:NoSchedule
-oc adm taint nodes master-2 node-role.kubernetes.io/master=:NoSchedule
-oc adm taint nodes master-3 node-role.kubernetes.io/master=:NoSchedule
+# Check provisioning logs
+oc logs -n openshift-machine-api -l baremetal.openshift.io/cluster-baremetal-operator=metal3-state
 ```
 
-**Verify:**
+**Troubleshooting:**
+- **Machine stuck in Pending**: Check BareMetalHost is in `available` state
+- **Host stuck in provisioning**: Check Redfish connectivity, view BMC console
+- **Node stuck in NotReady**: Check node logs with `oc debug node/worker-1`
+
+**Total time**: 15-30 minutes per worker from MachineSet creation to Ready
+
+#### Step 5: Disable Control Plane Scheduling (Optional but Recommended)
+
+**When to do this**: Once all workers are `Ready` and you want to dedicate control plane nodes to cluster management only.
+
+**Why**: In production, you typically don't want user workloads on control plane nodes. This reserves masters for:
+- Kubernetes control plane (API server, controller manager, scheduler)
+- etcd database
+- Cluster operators
+
+**Execute these commands once workers are Ready:**
+
+**Method 1: Taint masters (Recommended)**
+
+Add a taint that prevents scheduling on masters:
+
 ```bash
-# Check node status
+# Add NoSchedule taint to all masters
+for node in $(oc get nodes -l node-role.kubernetes.io/master -o name); do
+  oc adm taint node ${node#node/} node-role.kubernetes.io/master=:NoSchedule
+done
+```
+
+**Verify taints applied:**
+```bash
+oc get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints
+```
+
+**Method 2: Cordon masters**
+
+Mark masters as unschedulable (simpler but less flexible):
+
+```bash
+# Cordon all master nodes
+for node in $(oc get nodes -l node-role.kubernetes.io/master -o name); do
+  oc adm cordon ${node#node/}
+done
+```
+
+**Verify cordoned:**
+```bash
 oc get nodes
-
-# Should show:
-# master-1   Ready    control-plane,master   ...   (with taints)
-# master-2   Ready    control-plane,master   ...   (with taints)
-# master-3   Ready    control-plane,master   ...   (with taints)
-# worker-1   Ready    worker                 ...
-# worker-2   Ready    worker                 ...
+# Masters should show "Ready,SchedulingDisabled"
 ```
 
-**Important**: System pods (kube-apiserver, etcd, etc.) use tolerations to run on masters even with taints. User workloads will only schedule on worker nodes.
+**Method 3: Remove worker label (if present)**
+
+If masters have both master and worker roles:
+
+```bash
+# Check if masters have worker role
+oc get nodes -l node-role.kubernetes.io/master
+
+# Remove worker role from masters
+for node in $(oc get nodes -l node-role.kubernetes.io/master -o name); do
+  oc label ${node} node-role.kubernetes.io/worker-
+done
+```
+
+**Recommended approach**: Use Method 1 (taints) as it's the standard Kubernetes way and most flexible.
+
+**Verify final node configuration:**
+```bash
+oc get nodes -o wide
+
+# Expected output:
+# NAME       STATUS   ROLES                  AGE   VERSION
+# master-1   Ready    control-plane,master   2h    v1.29.0+xxx
+# master-2   Ready    control-plane,master   2h    v1.29.0+xxx
+# master-3   Ready    control-plane,master   2h    v1.29.0+xxx
+# worker-1   Ready    worker                 30m   v1.29.0+xxx
+# worker-2   Ready    worker                 30m   v1.29.0+xxx
+```
+
+**Test scheduling:**
+```bash
+# Create a test pod
+oc run test-pod --image=registry.access.redhat.com/ubi9/ubi:latest --command -- sleep 3600
+
+# Check where it was scheduled (should be on a worker)
+oc get pod test-pod -o wide
+
+# Clean up
+oc delete pod test-pod
+```
+
+**Important notes:**
+- System pods (kube-apiserver, etcd, etc.) use tolerations and will still run on masters
+- User workloads will only schedule on worker nodes
+- You can reverse this with: `oc adm taint nodes <master> node-role.kubernetes.io/master:NoSchedule-`
+
+**Your cluster is now fully configured with dedicated control plane and worker nodes!**
 
 ### How the Bare Metal Operator Works
 
