@@ -592,27 +592,33 @@ spec:
       metadata: {}
       providerSpec:
         value:
-          apiVersion: baremetal.cluster.k8s.io/v1alpha1
+          apiVersion: machine.openshift.io/v1beta1
           kind: BareMetalMachineProviderSpec
-          image:
-            url: <rhcos-image-url>
-            checksum: <checksum>
           userData:
             name: worker-user-data
 ```
+
+**Note**: The RHCOS image is automatically managed by the cluster's release payload and the Bare Metal Operator. You don't need to specify image URL or checksum.
 
 **Get cluster ID:**
 ```bash
 oc get -o jsonpath='{.status.infrastructureName}{"\n"}' infrastructure cluster
 ```
 
-**Get existing MachineSet as template:**
+**Best practice - Use existing MachineSet as template:**
 ```bash
-# If you have existing worker machines from install
-oc get machineset -n openshift-machine-api -o yaml
+# Get existing worker MachineSet (if created during install)
+oc get machineset -n openshift-machine-api -o yaml > worker-machineset-template.yaml
 
-# Or get master machineset as reference
-oc get machineset -n openshift-machine-api -o yaml
+# Or extract from a running cluster
+oc get machineset -n openshift-machine-api -o json | \
+  jq '.items[0]' | \
+  yq eval -P > worker-machineset-template.yaml
+
+# Edit and modify:
+# - Change metadata.name
+# - Update replicas count
+# - Ensure labels match your cluster
 ```
 
 **Create MachineSet:**
