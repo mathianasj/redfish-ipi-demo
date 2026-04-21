@@ -1,0 +1,314 @@
+---
+# Push Mirrored Images to Registry
+# This playbook performs the second phase of mirroring:
+#   1. Trust the mirror registry CA certificate
+#   2. Login to the local mirror registry
+#   3. Push images from disk to registry
+#
+# Prerequisites:
+#   - Mirror download completed (run-mirror.yml)
+#   - Mirror registry running
+#   - Downloaded images exist in mirror directory
+#
+# Usage:
+#   ansible-playbook push-to-registry.yml
+#
+#   # With custom mirror directory
+#   ansible-playbook push-to-registry.yml -e mirror_dir=/custom/path
+
+- name: Discover EC2 instance
+  import_playbook: inventory-ec2.yml
+
+- name: Push mirrored images to registry
+  hosts: nested_virt_hosts
+  become: false
+  gather_facts: true
+  vars:
+    mirror_dir: /home/ec2-user/mirror
+    registry_port: 8443
+    registry_user: admin
+    registry_password: admin123
+
+  pre_tasks:
+    - name: Display push plan
+      debug:
+        msg:
+          - "=========================================="
+          - "Push Mirrored Images to Registry"
+          - "=========================================="
+          - ""
+          - "Configuration:"
+          - "  Mirror directory: {{ mirror_dir }}"
+          - "  Registry: {{ ansible_host }}:{{ registry_port }}"
+          - "  Username: {{ registry_user }}"
+          - ""
+          - "This will:"
+          - "  1. Trust registry CA certificate"
+          - "  2. Login to mirror registry"
+          - "  3. Push images from disk to registry"
+          - ""
+          - "=========================================="
+
+    - name: Check if mirror registry is running
+      ansible.builtin.shell: podman ps | grep quay-app || true
+      register: registry_status
+      changed_when: false
+      become: true
+      become_user: ec2-user
+
+    - name: Fail if registry not running
+      fail:
+        msg: |
+          Mirror registry is not running!
+
+          Start it with:
+            ansible-playbook configure-mirror-registry.yml
+
+          Or check status:
+            ssh ec2-user@{{ ansible_host }} 'podman ps | grep quay'
+      when: registry_status.stdout == ""
+
+    - name: Check if mirror directory exists
+      ansible.builtin.stat:
+        path: "{{ mirror_dir }}"
+      register: mirror_dir_check
+
+    - name: Fail if mirror directory not found
+      fail:
+        msg: |
+          Mirror directory not found: {{ mirror_dir }}
+
+          Download images first with:
+            ansible-playbook run-mirror.yml
+
+          Or specify custom path:
+            ansible-playbook push-to-registry.yml -e mirror_dir=/path/to/mirror
+      when: not mirror_dir_check.stat.exists
+
+    - name: Check if mirror data exists
+      ansible.builtin.stat:
+        path: "{{ mirror_dir }}/v2"
+      register: mirror_data_check
+
+    - name: Fail if mirror data not found
+      fail:
+        msg: |
+          No mirror data found in {{ mirror_dir }}/v2
+
+          The directory exists but appears empty.
+          Run the mirror download first:
+            ansible-playbook run-mirror.yml
+      when: not mirror_data_check.stat.exists
+
+    - name: Check mirror data size
+      ansible.builtin.shell: du -sh {{ mirror_dir }} | cut -f1
+      register: mirror_size
+      changed_when: false
+
+    - name: Display mirror info
+      debug:
+        msg:
+          - "Mirror data found:"
+          - "  Location: {{ mirror_dir }}"
+          - "  Size: {{ mirror_size.stdout }}"
+
+  tasks:
+    - name: Check if CA certificate exists
+      ansible.builtin.stat:
+        path: /home/ec2-user/mirror-registry/quay-rootCA/rootCA.pem
+      register: ca_cert_check
+
+    - name: Fail if CA certificate not found
+      fail:
+        msg: |
+          Registry CA certificate not found!
+
+          Expected: /home/ec2-user/mirror-registry/quay-rootCA/rootCA.pem
+
+          Re-run mirror registry installation:
+            ansible-playbook configure-mirror-registry.yml
+      when: not ca_cert_check.stat.exists
+
+    - name: Check if CA is already trusted
+      ansible.builtin.stat:
+        path: /etc/pki/ca-trust/source/anchors/mirror-registry-ca.crt
+      register: ca_trusted_check
+
+    - name: Copy CA certificate to system trust store
+      ansible.builtin.copy:
+        src: /home/ec2-user/mirror-registry/quay-rootCA/rootCA.pem
+        dest: /etc/pki/ca-trust/source/anchors/mirror-registry-ca.crt
+        mode: '0644'
+        remote_src: true
+      become: true
+      when: not ca_trusted_check.stat.exists
+
+    - name: Update system CA trust
+      ansible.builtin.command: update-ca-trust
+      become: true
+      when: not ca_trusted_check.stat.exists
+
+    - name: Display CA trust status
+      debug:
+        msg: "✓ Registry CA certificate is trusted"
+
+    - name: Test registry connectivity
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:{{ registry_port }}/health/instance"
+        method: GET
+        validate_certs: true
+        status_code: 200
+      register: registry_health
+      ignore_errors: true
+
+    - name: Display registry health
+      debug:
+        msg: "✓ Registry is healthy and accessible"
+      when: registry_health is succeeded
+
+    - name: Warn if registry not accessible
+      debug:
+        msg: "⚠ Warning: Could not verify registry health, but continuing..."
+      when: registry_health is failed
+
+    - name: Login to mirror registry
+      ansible.builtin.shell: |
+        podman login -u {{ registry_user }} -p {{ registry_password }} {{ ansible_host }}:{{ registry_port }}
+      become: true
+      become_user: ec2-user
+      no_log: true
+      register: login_result
+      changed_when: "'Login Succeeded' in login_result.stdout"
+
+    - name: Display login status
+      debug:
+        msg: "✓ Successfully logged into registry"
+
+    - name: Check if tmux session already exists
+      ansible.builtin.shell: tmux has-session -t push 2>/dev/null
+      register: tmux_exists
+      changed_when: false
+      failed_when: false
+      become: true
+      become_user: ec2-user
+
+    - name: Display existing session warning
+      debug:
+        msg:
+          - "WARNING: tmux session 'push' already exists!"
+          - ""
+          - "Attach to it with:"
+          - "  ssh ec2-user@{{ ansible_host }}"
+          - "  tmux attach -t push"
+          - ""
+          - "Or kill it and re-run this playbook:"
+          - "  tmux kill-session -t push"
+      when: tmux_exists.rc == 0
+
+    - name: Fail if session exists
+      fail:
+        msg: "tmux session 'push' already exists. Attach to it or kill it first."
+      when: tmux_exists.rc == 0
+
+    - name: Create registry push script
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          set -e
+
+          echo "=========================================="
+          echo "Phase 2: Pushing Images to Registry"
+          echo "=========================================="
+          echo "Source: {{ mirror_dir }}"
+          echo "Registry: {{ ansible_host }}:{{ registry_port }}"
+          echo "Started: $(date)"
+          echo ""
+
+          cd /home/ec2-user
+          oc-mirror --v2 --from=file://{{ mirror_dir }} docker://{{ ansible_host }}:{{ registry_port }} 2>&1 | tee {{ mirror_dir }}/push.log
+
+          echo ""
+          echo "Push complete: $(date)"
+          echo ""
+          echo "Registry URL: https://{{ ansible_host }}:{{ registry_port }}"
+          echo "Username: {{ registry_user }}"
+          echo "Password: {{ registry_password }}"
+          echo ""
+          echo "Next steps:"
+          echo "  1. Access registry web UI: https://{{ ansible_host }}:{{ registry_port }}"
+          echo "  2. Check for ImageContentSourcePolicy files in {{ mirror_dir }}"
+          echo "  3. Apply ICSP to cluster or use in install-config.yaml"
+          echo ""
+          echo "Press Enter to exit..."
+          read
+        dest: /home/ec2-user/registry-push.sh
+        mode: '0755'
+        owner: ec2-user
+        group: ec2-user
+
+    - name: Start registry push in tmux
+      ansible.builtin.shell: |
+        tmux new-session -d -s push '/home/ec2-user/registry-push.sh'
+      become: true
+      become_user: ec2-user
+
+    - name: Wait a moment for tmux to start
+      ansible.builtin.pause:
+        seconds: 2
+
+    - name: Display next steps
+      debug:
+        msg:
+          - "=========================================="
+          - "Registry Push Started"
+          - "=========================================="
+          - ""
+          - "The push is running in tmux session 'push'"
+          - ""
+          - "To monitor progress:"
+          - "  ssh ec2-user@{{ ansible_host }}"
+          - "  tmux attach -t push"
+          - ""
+          - "Or check the push log:"
+          - "  ssh ec2-user@{{ ansible_host }}"
+          - "  tail -f {{ mirror_dir }}/push.log"
+          - ""
+          - "Detach from tmux: Ctrl+B then D"
+          - ""
+          - "When complete, access the registry:"
+          - "  URL: https://{{ ansible_host }}:{{ registry_port }}"
+          - "  Username: {{ registry_user }}"
+          - "  Password: {{ registry_password }}"
+          - ""
+          - "=========================================="
+
+  post_tasks:
+    - name: Create completion marker file
+      ansible.builtin.copy:
+        content: |
+          Registry push started at {{ ansible_date_time.iso8601 }}
+
+          Mirror directory: {{ mirror_dir }}
+          Registry: {{ ansible_host }}:{{ registry_port }}
+
+          To check status:
+            tmux attach -t push
+
+          To access registry:
+            URL: https://{{ ansible_host }}:{{ registry_port }}
+            Username: {{ registry_user }}
+            Password: {{ registry_password }}
+
+          After push completes:
+            1. Browse images at https://{{ ansible_host }}:{{ registry_port }}
+            2. Look for ImageContentSourcePolicy files:
+               find {{ mirror_dir }} -name "*imageContentSourcePolicy.yaml"
+            3. Apply ICSP to cluster:
+               oc apply -f <icsp-file>
+            Or add to install-config.yaml for new installations
+
+          See MIRROR-REGISTRY-GUIDE.md for more details
+        dest: /home/ec2-user/push-status.txt
+        mode: '0644'
+        owner: ec2-user
+        group: ec2-user

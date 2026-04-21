@@ -143,7 +143,7 @@
   register: oc_mirror_version
   changed_when: false
 
-- name: Display installed version
+- name: Display oc-mirror installed version
   debug:
     msg:
       - "=========================================="
@@ -155,9 +155,116 @@
       - ""
       - "Installed to: /usr/local/bin/oc-mirror"
       - ""
-      - "Usage (note: --v2 flag required for v2 features):"
-      - "  oc-mirror --help"
-      - "  oc-mirror --v2 --config=imageset-config-4.20.yaml file://mirror-output"
+      - "=========================================="
+
+- name: Download mirror-registry tool
+  ansible.builtin.get_url:
+    url: https://mirror.openshift.com/pub/openshift-v4/clients/mirror-registry/latest/mirror-registry.tar.gz
+    dest: /tmp/mirror-registry.tar.gz
+    mode: '0644'
+    timeout: 300
+
+- name: Create mirror-registry extraction directory
+  ansible.builtin.file:
+    path: /tmp/mirror-registry-extract
+    state: directory
+    mode: '0755'
+
+- name: Extract mirror-registry
+  ansible.builtin.unarchive:
+    src: /tmp/mirror-registry.tar.gz
+    dest: /tmp/mirror-registry-extract/
+    remote_src: yes
+
+- name: Find mirror-registry binary
+  ansible.builtin.find:
+    paths: /tmp/mirror-registry-extract
+    patterns: 'mirror-registry'
+    recurse: yes
+  register: mirror_registry_binary
+
+- name: Install mirror-registry to /usr/local/bin
+  ansible.builtin.copy:
+    src: "{{ mirror_registry_binary.files[0].path }}"
+    dest: /usr/local/bin/mirror-registry
+    mode: '0755'
+    remote_src: yes
+
+- name: Cleanup mirror-registry download
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /tmp/mirror-registry.tar.gz
+    - /tmp/mirror-registry-extract
+
+- name: Create mirror registry data directory
+  ansible.builtin.file:
+    path: /home/ec2-user/mirror-registry
+    state: directory
+    mode: '0755'
+    owner: ec2-user
+    group: ec2-user
+
+- name: Check if mirror registry is already installed
+  ansible.builtin.stat:
+    path: /home/ec2-user/mirror-registry/quay-rootCA/rootCA.pem
+  register: mirror_registry_installed
+
+- name: Install mirror registry
+  ansible.builtin.shell: |
+    /usr/local/bin/mirror-registry install \
+      --quayHostname {{ ansible_host }} \
+      --quayRoot /home/ec2-user/mirror-registry \
+      --initPassword admin123 \
+      --initUser admin \
+      --verbose
+  args:
+    creates: /home/ec2-user/mirror-registry/quay-rootCA/rootCA.pem
+  become: true
+  become_user: ec2-user
+  when: not mirror_registry_installed.stat.exists
+
+- name: Configure firewall for mirror registry (HTTPS)
+  ansible.posix.firewalld:
+    zone: public
+    port: 8443/tcp
+    permanent: yes
+    state: enabled
+  notify: reload firewalld
+  ignore_errors: true
+
+- name: Verify mirror registry is running
+  ansible.builtin.shell: podman ps | grep quay || true
+  register: quay_status
+  changed_when: false
+  become: true
+  become_user: ec2-user
+
+- name: Display mirror registry installation status
+  debug:
+    msg:
+      - "=========================================="
+      - "Mirror Registry Installation Complete"
+      - "=========================================="
       - ""
-      - "Without --v2 flag, oc-mirror runs in v1 compatibility mode"
+      - "Mirror Registry (Quay):"
+      - "  URL: https://{{ ansible_host }}:8443"
+      - "  Username: admin"
+      - "  Password: admin123"
+      - "  Storage: /home/ec2-user/mirror-registry"
+      - ""
+      - "CA Certificate:"
+      - "  Location: /home/ec2-user/mirror-registry/quay-rootCA/rootCA.pem"
+      - ""
+      - "Trust the CA certificate:"
+      - "  sudo cp /home/ec2-user/mirror-registry/quay-rootCA/rootCA.pem /etc/pki/ca-trust/source/anchors/"
+      - "  sudo update-ca-trust"
+      - ""
+      - "Login to registry:"
+      - "  podman login -u admin -p admin123 {{ ansible_host }}:8443"
+      - ""
+      - "Registry Status:"
+      - "  {{ 'Running' if quay_status.stdout else 'Not running - check logs' }}"
+      - ""
       - "=========================================="

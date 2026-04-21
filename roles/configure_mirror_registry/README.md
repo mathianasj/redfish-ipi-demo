@@ -4,11 +4,19 @@ This Ansible role downloads and installs the oc-mirror v2 tool for mirroring Ope
 
 ## Description
 
-The role:
+The role installs and configures a complete disconnected mirroring solution:
+
+**oc-mirror v2:**
 - Downloads oc-mirror v2 from the official OpenShift mirror site
 - Extracts and installs it to `/usr/local/bin/oc-mirror`
 - Configures PATH for the ec2-user
-- Verifies the installation
+
+**Mirror Registry (Quay):**
+- Downloads and installs mirror-registry tool
+- Deploys a local Quay-based container registry
+- Configures HTTPS with self-signed certificates
+- Sets up initial admin user
+- Configures firewall rules
 
 ## Requirements
 
@@ -69,24 +77,70 @@ ansible-playbook configure-mirror-registry.yml
 
 ## What Gets Installed
 
+### Tools
 - **oc-mirror** - Latest version from OpenShift 4.20 release channel
   - Location: `/usr/local/bin/oc-mirror`
+- **mirror-registry** - OpenShift mirror registry installer
+  - Location: `/usr/local/bin/mirror-registry`
 - **podman** - Container runtime for pulling/pushing images
 - **skopeo** - Container image manipulation tool
+
+### Mirror Registry (Quay)
+- **Quay container registry** - Running on port 8443
+  - URL: `https://<instance-ip>:8443`
+  - Username: `admin`
+  - Password: `admin123`
+  - Storage: `/home/ec2-user/mirror-registry`
+  - CA Certificate: `/home/ec2-user/mirror-registry/quay-rootCA/rootCA.pem`
+
+### Authentication
 - **Pull secret** - Red Hat registry authentication
   - `/home/ec2-user/.docker/config.json`
   - `/home/ec2-user/.config/containers/auth.json`
 
 ## After Installation
 
-Once installed, you can use oc-mirror v2 with your ImageSetConfiguration:
+### Complete Mirroring Workflow
+
+**Step 1: Download images with oc-mirror**
+```bash
+# Create output directory
+mkdir -p /home/ec2-user/mirror
+
+# Download images to disk (note: --v2 flag required)
+oc-mirror --v2 --config=imageset-config-4.20.yaml file:///home/ec2-user/mirror
+```
+
+**Step 2: Trust the registry CA certificate**
+```bash
+# Copy CA cert to system trust store
+sudo cp /home/ec2-user/mirror-registry/quay-rootCA/rootCA.pem /etc/pki/ca-trust/source/anchors/
+
+# Update system CA trust
+sudo update-ca-trust
+```
+
+**Step 3: Login to the local mirror registry**
+```bash
+# Login with default credentials
+podman login -u admin -p admin123 <instance-ip>:8443
+```
+
+**Step 4: Push mirrored images to local registry**
+```bash
+# Push from disk to local registry
+oc-mirror --v2 --from=file:///home/ec2-user/mirror docker://<instance-ip>:8443
+```
+
+**Step 5: Access the mirror registry web UI**
+- URL: `https://<instance-ip>:8443`
+- Username: `admin`
+- Password: `admin123`
+
+### Quick Commands
 
 ```bash
-# Mirror OpenShift images and operators (note: --v2 flag required)
-mkdir -p /home/ec2-user/mirror
-oc-mirror --v2 --config=imageset-config-4.20.yaml file:///home/ec2-user/mirror
-
-# Check version
+# Check oc-mirror version
 oc-mirror version
 
 # View help
@@ -94,6 +148,12 @@ oc-mirror --help
 
 # View v2-specific help
 oc-mirror --v2 --help
+
+# Check registry status
+podman ps | grep quay
+
+# View registry logs
+podman logs -f $(podman ps | grep quay | awk '{print $1}')
 ```
 
 **Important:** The `--v2` flag is required to use oc-mirror v2 features and the v2alpha1 ImageSetConfiguration format. Without this flag, oc-mirror runs in v1 compatibility mode.

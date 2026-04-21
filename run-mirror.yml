@@ -1,0 +1,252 @@
+---
+# Run OpenShift Image Mirroring
+# This playbook performs the complete mirroring workflow:
+#   1. Download images from Red Hat registries (oc-mirror to disk)
+#   2. Trust the mirror registry CA certificate
+#   3. Login to the local mirror registry
+#   4. Push images from disk to registry
+#
+# WARNING: This will download 50-80 GB (full config) and take 45-90 minutes on EC2
+#
+# Usage:
+#   # Test with minimal config first (recommended)
+#   ansible-playbook run-mirror.yml -e mirror_config=minimal
+#
+#   # Full mirror
+#   ansible-playbook run-mirror.yml
+#
+#   # Custom config
+#   ansible-playbook run-mirror.yml -e mirror_config=/path/to/config.yaml
+
+- name: Discover EC2 instance
+  import_playbook: inventory-ec2.yml
+
+- name: Run OpenShift image mirroring
+  hosts: nested_virt_hosts
+  become: false
+  gather_facts: true
+  vars:
+    mirror_config: "{{ mirror_config | default('full') }}"
+    mirror_dir: /home/ec2-user/mirror
+    registry_port: 8443
+    registry_user: admin
+    registry_password: admin123
+
+  pre_tasks:
+    - name: Determine config file to use
+      set_fact:
+        config_file: >-
+          {%- if mirror_config == 'minimal' -%}
+          imageset-config-minimal.yaml
+          {%- elif mirror_config == 'full' -%}
+          imageset-config-4.20.yaml
+          {%- else -%}
+          {{ mirror_config }}
+          {%- endif -%}
+
+    - name: Display mirror plan
+      debug:
+        msg:
+          - "=========================================="
+          - "OpenShift Image Mirroring"
+          - "=========================================="
+          - ""
+          - "Configuration:"
+          - "  Config file: {{ config_file }}"
+          - "  Mirror directory: {{ mirror_dir }}"
+          - "  Registry: {{ ansible_host }}:{{ registry_port }}"
+          - ""
+          - "{% if mirror_config == 'minimal' %}Estimated download: 10-15 GB, 10-20 minutes{% else %}Estimated download: 50-80 GB, 45-90 minutes{% endif %}"
+          - ""
+          - "Workflow:"
+          - "  1. Download images to disk (oc-mirror)"
+          - "  2. Trust registry CA certificate"
+          - "  3. Login to mirror registry"
+          - "  4. Push images to registry"
+          - ""
+          - "This will run in tmux session 'mirror'"
+          - "You can detach with Ctrl+B then D"
+          - "Reattach with: tmux attach -t mirror"
+          - ""
+          - "=========================================="
+
+    - name: Check if mirror registry is running
+      ansible.builtin.shell: podman ps | grep quay-app || true
+      register: registry_status
+      changed_when: false
+      become: true
+      become_user: ec2-user
+
+    - name: Fail if registry not running
+      fail:
+        msg: |
+          Mirror registry is not running!
+
+          Start it with:
+            ansible-playbook configure-mirror-registry.yml
+
+          Or check status:
+            ssh ec2-user@{{ ansible_host }} 'podman ps | grep quay'
+      when: registry_status.stdout == ""
+
+    - name: Check if oc-mirror is installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/oc-mirror
+      register: oc_mirror_installed
+
+    - name: Fail if oc-mirror not installed
+      fail:
+        msg: |
+          oc-mirror is not installed!
+
+          Install it with:
+            ansible-playbook configure-mirror-registry.yml
+      when: not oc_mirror_installed.stat.exists
+
+    - name: Check if config file exists
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/{{ config_file }}"
+      register: config_file_check
+      delegate_to: localhost
+      become: false
+
+    - name: Fail if config file not found
+      fail:
+        msg: |
+          Configuration file not found: {{ config_file }}
+
+          Available configs:
+            - imageset-config-minimal.yaml (test, 10-15 GB)
+            - imageset-config-4.20.yaml (full, 50-80 GB)
+      when: not config_file_check.stat.exists
+
+    - name: Copy config file to EC2 instance
+      ansible.builtin.copy:
+        src: "{{ config_file }}"
+        dest: /home/ec2-user/{{ config_file | basename }}
+        mode: '0644'
+        owner: ec2-user
+        group: ec2-user
+
+  tasks:
+    - name: Create mirror output directory
+      ansible.builtin.file:
+        path: "{{ mirror_dir }}"
+        state: directory
+        mode: '0755'
+        owner: ec2-user
+        group: ec2-user
+
+    - name: Check if tmux session already exists
+      ansible.builtin.shell: tmux has-session -t mirror 2>/dev/null
+      register: tmux_exists
+      changed_when: false
+      failed_when: false
+      become: true
+      become_user: ec2-user
+
+    - name: Display existing session warning
+      debug:
+        msg:
+          - "WARNING: tmux session 'mirror' already exists!"
+          - ""
+          - "Attach to it with:"
+          - "  ssh ec2-user@{{ ansible_host }}"
+          - "  tmux attach -t mirror"
+          - ""
+          - "Or kill it and re-run this playbook:"
+          - "  tmux kill-session -t mirror"
+      when: tmux_exists.rc == 0
+
+    - name: Fail if session exists
+      fail:
+        msg: "tmux session 'mirror' already exists. Attach to it or kill it first."
+      when: tmux_exists.rc == 0
+
+    - name: Create mirror download script
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          set -e
+
+          echo "=========================================="
+          echo "Phase 1: Downloading Images"
+          echo "=========================================="
+          echo "Config: {{ config_file | basename }}"
+          echo "Output: {{ mirror_dir }}"
+          echo "Started: $(date)"
+          echo ""
+
+          cd /home/ec2-user
+          oc-mirror --v2 --config={{ config_file | basename }} file://{{ mirror_dir }} 2>&1 | tee {{ mirror_dir }}/download.log
+
+          echo ""
+          echo "Download complete: $(date)"
+          echo "Total size: $(du -sh {{ mirror_dir }} | cut -f1)"
+          echo ""
+          echo "Press Enter to continue with registry push..."
+          read
+        dest: /home/ec2-user/mirror-download.sh
+        mode: '0755'
+        owner: ec2-user
+        group: ec2-user
+
+    - name: Start mirror download in tmux
+      ansible.builtin.shell: |
+        tmux new-session -d -s mirror '/home/ec2-user/mirror-download.sh'
+      become: true
+      become_user: ec2-user
+
+    - name: Wait a moment for tmux to start
+      ansible.builtin.pause:
+        seconds: 2
+
+    - name: Display next steps
+      debug:
+        msg:
+          - "=========================================="
+          - "Mirror Download Started"
+          - "=========================================="
+          - ""
+          - "The download is running in tmux session 'mirror'"
+          - ""
+          - "To monitor progress:"
+          - "  ssh ec2-user@{{ ansible_host }}"
+          - "  tmux attach -t mirror"
+          - ""
+          - "In another terminal, watch disk usage:"
+          - "  ssh ec2-user@{{ ansible_host }}"
+          - "  watch -n 30 'du -sh {{ mirror_dir }}'"
+          - ""
+          - "Or check the download log:"
+          - "  ssh ec2-user@{{ ansible_host }}"
+          - "  tail -f {{ mirror_dir }}/download.log"
+          - ""
+          - "When download completes, run the push playbook:"
+          - "  ansible-playbook push-to-registry.yml"
+          - ""
+          - "Or continue manually in the tmux session"
+          - "(press Enter when prompted to push to registry)"
+          - ""
+          - "Detach from tmux: Ctrl+B then D"
+          - "=========================================="
+
+  post_tasks:
+    - name: Create completion marker file
+      ansible.builtin.copy:
+        content: |
+          Mirror download started at {{ ansible_date_time.iso8601 }}
+
+          Config: {{ config_file }}
+          Mirror directory: {{ mirror_dir }}
+          Registry: {{ ansible_host }}:{{ registry_port }}
+
+          To check status:
+            tmux attach -t mirror
+
+          To push to registry after download:
+            ansible-playbook push-to-registry.yml
+        dest: /home/ec2-user/mirror-status.txt
+        mode: '0644'
+        owner: ec2-user
+        group: ec2-user

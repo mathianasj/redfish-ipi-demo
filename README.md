@@ -193,6 +193,33 @@ This will:
 - Create BareMetalHost manifests
 - Let OpenShift provision them automatically
 
+### Mirror OpenShift Images
+
+For disconnected/air-gapped environments:
+
+```bash
+# Step 1: Install mirror registry
+ansible-playbook configure-mirror-registry.yml
+
+# Step 2: Download images (50-80 GB, 45-90 minutes on EC2)
+ansible-playbook run-mirror.yml
+
+# Step 3: Push to registry
+ansible-playbook push-to-registry.yml
+
+# Test first with minimal config (10-15 GB, 10-20 minutes)
+ansible-playbook run-mirror.yml -e mirror_config=minimal
+```
+
+This provides:
+- Local mirror registry (Quay)
+- oc-mirror v2 tool
+- Automated download workflow
+- Automated push workflow
+- Access at: https://<instance-ip>:8443
+
+See [MIRROR-REGISTRY-GUIDE.md](MIRROR-REGISTRY-GUIDE.md) for complete details.
+
 ## How OpenShift IPI Works with Redfish
 
 ### Installation Flow
@@ -346,6 +373,7 @@ For network isolation and advanced routing:
 - [CLEANUP.md](CLEANUP.md) - Resource deletion
 
 ### Disconnected/Air-Gapped Environments
+- [MIRROR-REGISTRY-GUIDE.md](MIRROR-REGISTRY-GUIDE.md) - Complete mirror registry setup and workflow
 - [OC-MIRROR-TIMING.md](OC-MIRROR-TIMING.md) - Mirror timing, sizing, and best practices
 - [PULL-SECRET.md](PULL-SECRET.md) - Red Hat pull secret setup
 
