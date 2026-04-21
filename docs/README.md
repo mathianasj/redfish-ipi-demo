@@ -32,7 +32,8 @@ Complete documentation for the OpenShift IPI Baremetal Demo with Redfish on AWS 
 | Document | Description |
 |----------|-------------|
 | [Complete Deployment](openshift/COMPLETE_DEPLOYMENT.md) | End-to-end deployment workflow |
-| [install-config.yaml Guide](openshift/INSTALL-CONFIG-GUIDE.md) | **NEW** - Field reference and configuration examples |
+| [Redfish Baremetal Install Guide](openshift/REDFISH-BAREMETAL-INSTALL.md) | **NEW** - Manual install-config.yaml creation and real-world Redfish |
+| [install-config.yaml Guide](openshift/INSTALL-CONFIG-GUIDE.md) | Field reference and configuration examples |
 | [Redfish/BMC Guide](openshift/SUSHY_REDFISH.md) | Redfish API integration and usage |
 | [Pull Secret Setup](openshift/PULL-SECRET.md) | Red Hat pull secret configuration |
 

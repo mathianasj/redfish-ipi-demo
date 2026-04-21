@@ -363,6 +363,7 @@ For network isolation and advanced routing:
 
 ### 🔴 OpenShift Deployment
 - **[Complete Deployment](docs/openshift/COMPLETE_DEPLOYMENT.md)** - End-to-end deployment workflow
+- **[Redfish Baremetal Install Guide](docs/openshift/REDFISH-BAREMETAL-INSTALL.md)** - Manual install-config.yaml creation and real-world Redfish
 - **[install-config.yaml Guide](docs/openshift/INSTALL-CONFIG-GUIDE.md)** - Field reference and configuration examples
 - **[Redfish/BMC Guide](docs/openshift/SUSHY_REDFISH.md)** - Redfish API integration and usage
 - **[Pull Secret Setup](docs/openshift/PULL-SECRET.md)** - Red Hat pull secret configuration
