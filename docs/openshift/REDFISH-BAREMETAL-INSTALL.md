@@ -324,16 +324,60 @@ sshKey: 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC...'
 
 ### Step 4: Add Master Hosts
 
-For each master node, add a host entry with Redfish details:
+For each master node, add a host entry with Redfish details.
+
+#### Understanding Virtual IPs (VIPs)
+
+Before configuring hosts, you need to assign two virtual IP addresses:
+
+**apiVIPs** - API Server Virtual IP:
+- Used for Kubernetes API server access
+- Must resolve to: `api.<cluster-name>.<base-domain>`
+- Example: `api.ocp.example.com` → `10.0.10.5`
+- Used by: `oc` CLI, kubectl, automation tools
+
+**ingressVIPs** - Ingress/Router Virtual IP:
+- Used for application ingress (routes)
+- Must resolve to: `*.apps.<cluster-name>.<base-domain>`
+- Example: `*.apps.ocp.example.com` → `10.0.10.6`
+- Used by: Web console, application routes
+
+**CRITICAL Requirements:**
+- ✅ Both VIPs **MUST** be within the `machineNetwork` CIDR (e.g., `10.0.10.0/24`)
+- ✅ VIPs **MUST** be outside DHCP range (use static allocation range)
+- ✅ VIPs **MUST** be unused IPs (not assigned to any host)
+- ✅ VIPs **MUST** have DNS A records (or /etc/hosts entries)
+- ✅ VIPs **MUST** be reachable from all cluster nodes
+
+**Example Network Planning:**
+```
+machineNetwork: 10.0.10.0/24
+Gateway:        10.0.10.1
+DHCP Range:     10.0.10.100 - 10.0.10.200
+Static Range:   10.0.10.2 - 10.0.10.99
+
+Assigned IPs:
+- API VIP:      10.0.10.5  (static, in machineNetwork)
+- Ingress VIP:  10.0.10.6  (static, in machineNetwork)
+- Master-1:     10.0.10.10 (static, in machineNetwork)
+- Master-2:     10.0.10.11 (static, in machineNetwork)
+- Master-3:     10.0.10.12 (static, in machineNetwork)
+```
+
+#### Host Configuration with Static IPs
+
+**Option 1: DHCP-based (simpler, recommended for testing)**
+
+Let nodes get IPs via DHCP, identify by MAC address:
 
 ```yaml
 platform:
   baremetal:
     provisioningNetwork: Disabled
     apiVIPs:
-    - 10.0.10.5
+    - 10.0.10.5                     # API server VIP (must be in machineNetwork)
     ingressVIPs:
-    - 10.0.10.6
+    - 10.0.10.6                     # Ingress/router VIP (must be in machineNetwork)
     hosts:
     - name: master-1
       role: master
@@ -342,7 +386,7 @@ platform:
         username: admin
         password: bmcpassword
         disableCertificateVerification: true
-      bootMACAddress: "d4:ae:52:a1:b2:c3"
+      bootMACAddress: "d4:ae:52:a1:b2:c3"    # Primary NIC MAC
       rootDeviceHints:
         deviceName: "/dev/sda"
     - name: master-2
@@ -366,6 +410,138 @@ platform:
       rootDeviceHints:
         deviceName: "/dev/sda"
 ```
+
+**Option 2: Static IP Assignment (production, more control)**
+
+Assign specific static IPs to each master node:
+
+```yaml
+platform:
+  baremetal:
+    provisioningNetwork: Disabled
+    apiVIPs:
+    - 10.0.10.5                     # API VIP (in machineNetwork CIDR)
+    ingressVIPs:
+    - 10.0.10.6                     # Ingress VIP (in machineNetwork CIDR)
+    hosts:
+    - name: master-1
+      role: master
+      bmc:
+        address: redfish-virtualmedia://10.0.10.101/redfish/v1/Systems/System.Embedded.1
+        username: admin
+        password: bmcpassword
+        disableCertificateVerification: true
+      bootMACAddress: "d4:ae:52:a1:b2:c3"
+      rootDeviceHints:
+        deviceName: "/dev/sda"
+      # Static IP configuration
+      networkConfig:
+        interfaces:
+        - name: eno1                 # Interface name (adjust to your hardware)
+          type: ethernet
+          state: up
+          mac-address: "d4:ae:52:a1:b2:c3"
+          ipv4:
+            enabled: true
+            address:
+            - ip: 10.0.10.10         # Static IP (in machineNetwork CIDR)
+              prefix-length: 24
+            dhcp: false
+          ipv6:
+            enabled: false
+        dns-resolver:
+          config:
+            server:
+            - 10.0.10.1              # DNS server
+        routes:
+          config:
+          - destination: 0.0.0.0/0
+            next-hop-address: 10.0.10.1
+            next-hop-interface: eno1
+    - name: master-2
+      role: master
+      bmc:
+        address: redfish-virtualmedia://10.0.10.102/redfish/v1/Systems/System.Embedded.1
+        username: admin
+        password: bmcpassword
+        disableCertificateVerification: true
+      bootMACAddress: "d4:ae:52:d4:e5:f6"
+      rootDeviceHints:
+        deviceName: "/dev/sda"
+      networkConfig:
+        interfaces:
+        - name: eno1
+          type: ethernet
+          state: up
+          mac-address: "d4:ae:52:d4:e5:f6"
+          ipv4:
+            enabled: true
+            address:
+            - ip: 10.0.10.11         # Static IP (in machineNetwork CIDR)
+              prefix-length: 24
+            dhcp: false
+          ipv6:
+            enabled: false
+        dns-resolver:
+          config:
+            server:
+            - 10.0.10.1
+        routes:
+          config:
+          - destination: 0.0.0.0/0
+            next-hop-address: 10.0.10.1
+            next-hop-interface: eno1
+    - name: master-3
+      role: master
+      bmc:
+        address: redfish-virtualmedia://10.0.10.103/redfish/v1/Systems/System.Embedded.1
+        username: admin
+        password: bmcpassword
+        disableCertificateVerification: true
+      bootMACAddress: "d4:ae:52:12:34:56"
+      rootDeviceHints:
+        deviceName: "/dev/sda"
+      networkConfig:
+        interfaces:
+        - name: eno1
+          type: ethernet
+          state: up
+          mac-address: "d4:ae:52:12:34:56"
+          ipv4:
+            enabled: true
+            address:
+            - ip: 10.0.10.12         # Static IP (in machineNetwork CIDR)
+              prefix-length: 24
+            dhcp: false
+          ipv6:
+            enabled: false
+        dns-resolver:
+          config:
+            server:
+            - 10.0.10.1
+        routes:
+          config:
+          - destination: 0.0.0.0/0
+            next-hop-address: 10.0.10.1
+            next-hop-interface: eno1
+```
+
+**When to use static IPs:**
+- Production deployments
+- No DHCP server available
+- Need predictable IP assignments
+- Strict network policies
+
+**When to use DHCP:**
+- Lab/testing environments
+- DHCP reservations configured by MAC
+- Simpler configuration
+
+**Important notes for static IPs:**
+- Interface name (`eno1`, `ens192`, etc.) must match your hardware
+- Find interface name from BMC console or server documentation
+- All IPs must be in the `machineNetwork` CIDR range
+- VIPs and host IPs must not conflict
 
 ### Step 5: Understanding Redfish Address Formats
 
