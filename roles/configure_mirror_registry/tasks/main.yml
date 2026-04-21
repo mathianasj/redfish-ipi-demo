@@ -190,6 +190,21 @@
     mode: '0755'
     remote_src: yes
 
+- name: Find execution-environment.tar
+  ansible.builtin.find:
+    paths: /tmp/mirror-registry-extract
+    patterns: 'execution-environment.tar'
+    recurse: yes
+  register: execution_environment_tar
+
+- name: Install execution-environment.tar to /usr/local/bin
+  ansible.builtin.copy:
+    src: "{{ execution_environment_tar.files[0].path }}"
+    dest: /usr/local/bin/execution-environment.tar
+    mode: '0644'
+    remote_src: yes
+  when: execution_environment_tar.files | length > 0
+
 - name: Cleanup mirror-registry download
   ansible.builtin.file:
     path: "{{ item }}"
