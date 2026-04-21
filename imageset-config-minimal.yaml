@@ -1,0 +1,26 @@
+# Minimal ImageSetConfiguration for Testing oc-mirror
+#
+# This config mirrors only the OpenShift 4.20.1 platform (no operators, no VM images)
+# Perfect for testing before running the full mirror.
+#
+# Download size: ~10-15 GB
+# Time: 10-20 minutes on EC2, 30-60 minutes on home internet
+#
+# Usage:
+#   mkdir -p /home/ec2-user/mirror-test
+#   oc-mirror --v2 --config=imageset-config-minimal.yaml file:///home/ec2-user/mirror-test
+#
+# After testing successfully, use imageset-config-4.20.yaml for the full mirror.
+#
+kind: ImageSetConfiguration
+apiVersion: mirror.openshift.io/v2alpha1
+mirror:
+  platform:
+    channels:
+      - name: stable-4.20
+        type: ocp
+        minVersion: 4.20.1
+        maxVersion: 4.20.1  # Pin to specific version for testing
+  operators: []
+  additionalImages: []
+  helm: {}

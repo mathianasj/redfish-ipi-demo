@@ -1,18 +1,26 @@
 ---
 # Complete OpenShift Baremetal on EC2 Deployment
-# This playbook performs a full end-to-end deployment:
+# This playbook performs infrastructure preparation and optional OpenShift installation:
 #   1. AWS Infrastructure - Create EC2 instance with nested virtualization
 #   2. Configure Virtualization - Setup KVM, libvirt, networking
 #   3. DNS Configuration - Setup BIND DNS for OpenShift domains
 #   4. Prepare OpenShift - Create VMs and install-config.yaml
-#   5. Install OpenShift - Run openshift-install and configure access
+#   5. Install OpenShift (OPTIONAL) - Run openshift-install and configure access
 #
-# Total estimated time: 60-90 minutes
+# Usage:
+#   Prepare only (default): ansible-playbook playbook.yml
+#   Prepare + Install:      ansible-playbook playbook.yml -e install_openshift=true
+#
+# Total estimated time:
+#   - Preparation only: 20-35 minutes
+#   - Full installation: 60-90 minutes
+#
+# Time breakdown:
 #   - AWS setup: 5-10 minutes
 #   - Virtualization setup: 10-15 minutes
 #   - DNS configuration: 2-3 minutes
 #   - OpenShift preparation: 5-10 minutes
-#   - OpenShift installation: 45-60 minutes
+#   - OpenShift installation (if enabled): 45-60 minutes
 
 - name: Create EC2 instance with nested virtualization support
   hosts: localhost
@@ -36,11 +44,50 @@
     cpu_threads_per_core: 2
 
   pre_tasks:
-    - name: Display deployment workflow
+    - name: Display deployment workflow (preparation only)
       debug:
         msg:
           - "=========================================="
-          - "OpenShift Baremetal on EC2 - Complete Deployment"
+          - "OpenShift Baremetal on EC2 - Infrastructure Deployment"
+          - "=========================================="
+          - ""
+          - "This playbook will execute the following phases:"
+          - ""
+          - "Phase 1: AWS Infrastructure (5-10 min)"
+          - "  ✓ Create VPC and networking"
+          - "  ✓ Launch EC2 instance ({{ instance_type }})"
+          - "  ✓ Configure security groups"
+          - ""
+          - "Phase 2: Virtualization Setup (10-15 min)"
+          - "  ✓ Install KVM and libvirt"
+          - "  ✓ Configure networking bridges"
+          - "  ✓ Setup Redfish BMC (sushy-tools)"
+          - "  ✓ Install OpenShift CLI tools"
+          - ""
+          - "Phase 3: DNS Configuration (2-3 min)"
+          - "  ✓ Install and configure BIND DNS"
+          - "  ✓ Create OpenShift DNS records"
+          - ""
+          - "Phase 4: OpenShift Preparation (5-10 min)"
+          - "  ✓ Create master VMs (3 nodes)"
+          - "  ✓ Generate install-config.yaml"
+          - "  ✓ Configure network settings"
+          - ""
+          - "Phase 5: OpenShift Installation (OPTIONAL - 45-60 min)"
+          - "  ✗ SKIPPED - Use -e install_openshift=true to enable"
+          - ""
+          - "Total estimated time: 20-35 minutes"
+          - ""
+          - "After preparation, you can manually install OpenShift or"
+          - "re-run with: ansible-playbook playbook.yml -e install_openshift=true"
+          - "=========================================="
+      when: not (install_openshift | default(false) | bool)
+
+    - name: Display deployment workflow (with installation)
+      debug:
+        msg:
+          - "=========================================="
+          - "OpenShift Baremetal on EC2 - Full Deployment"
           - "=========================================="
           - ""
           - "This playbook will execute the following phases:"
@@ -66,16 +113,15 @@
           - "  ✓ Configure network settings"
           - ""
           - "Phase 5: OpenShift Installation (45-60 min)"
-          - "  ✓ Run openshift-install in tmux"
-          - "  ✓ Monitor progress"
-          - "  ✓ Configure kubeconfig access"
-          - "  ✓ Save credentials and URLs"
+          - "  ✓ ENABLED - Will run openshift-install in tmux"
+          - "  ✓ Monitor progress and configure access"
           - ""
           - "Total estimated time: 60-90 minutes"
           - ""
           - "You can safely disconnect during Phase 5."
           - "The installation will continue in tmux."
           - "=========================================="
+      when: install_openshift | default(false) | bool
 
   tasks:
     - name: Read SSH public key
@@ -1495,17 +1541,47 @@
   roles:
     - openshift_install
 
+  post_tasks:
+    - name: Display preparation-only completion message
+      debug:
+        msg:
+          - "=========================================="
+          - "✓ OpenShift Preparation Complete"
+          - "=========================================="
+          - ""
+          - "Infrastructure is ready:"
+          - "  ✓ AWS EC2 instance with nested virtualization"
+          - "  ✓ DNS server configured for OpenShift domains"
+          - "  ✓ Master VMs created and ready"
+          - "  ✓ install-config.yaml generated"
+          - ""
+          - "OpenShift installation SKIPPED (use -e install_openshift=true to install)"
+          - ""
+          - "To install OpenShift manually:"
+          - "  ssh ec2-user@{{ ansible_host }}"
+          - "  cd ~/ocp-install"
+          - "  tmux new -s openshift-install"
+          - "  openshift-install create cluster --dir=. --log-level=debug"
+          - ""
+          - "Or re-run this playbook with installation enabled:"
+          - "  ansible-playbook playbook.yml -e install_openshift=true"
+          - ""
+          - "=========================================="
+      when: not (install_openshift | default(false) | bool)
+
 - name: Install OpenShift cluster
   hosts: nested_virt_hosts
   become: true
   gather_facts: true
+  # Only run this play if install_openshift is set to true
+  # Usage: ansible-playbook playbook.yml -e install_openshift=true
 
   pre_tasks:
     - name: Display installation phase
       debug:
         msg:
           - "=========================================="
-          - "Phase 5: OpenShift Cluster Installation"
+          - "Phase 5: OpenShift Cluster Installation (ENABLED)"
           - "=========================================="
           - ""
           - "Starting OpenShift cluster installation:"
@@ -1523,16 +1599,18 @@
           - "  ssh ec2-user@{{ ansible_host }}"
           - "  tmux attach -t openshift-install"
           - "=========================================="
+      when: install_openshift | default(false) | bool
 
   roles:
-    - openshift_install_cluster
+    - role: openshift_install_cluster
+      when: install_openshift | default(false) | bool
 
   post_tasks:
-    - name: Display completion summary
+    - name: Display installation completion summary
       debug:
         msg:
           - "=========================================="
-          - "✓ Complete OpenShift Setup Finished"
+          - "✓ OpenShift Installation Complete"
           - "=========================================="
           - ""
           - "All components are now configured:"
@@ -1549,3 +1627,4 @@
           - "  cat ~/openshift-cluster-access.txt"
           - ""
           - "=========================================="
+      when: install_openshift | default(false) | bool

@@ -46,13 +46,16 @@ Thumbs.db
 *.bak
 
 # OpenShift install files (contain secrets)
-install-config.yaml.backup
+*install-config.yaml
+*install-config.yaml.*
 auth/
 metadata.json
 *.ign
 pullsecret.json
 kubeconfig
 kubeadmin-password
+.openshift_install.log
+.openshift_install_state.json
 
 # Sensitive data patterns
 *secret*

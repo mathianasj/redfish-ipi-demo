@@ -1,0 +1,163 @@
+---
+- name: Ensure /usr/local/bin is in ec2-user's PATH
+  ansible.builtin.lineinfile:
+    path: /home/ec2-user/.bashrc
+    line: 'export PATH="/usr/local/bin:$PATH"'
+    regexp: '^export PATH="/usr/local/bin'
+    state: present
+    create: yes
+    owner: ec2-user
+    group: ec2-user
+    mode: '0644'
+
+- name: Ensure /usr/local/bin is in ec2-user's bash_profile
+  ansible.builtin.lineinfile:
+    path: /home/ec2-user/.bash_profile
+    line: 'export PATH="/usr/local/bin:$PATH"'
+    regexp: '^export PATH="/usr/local/bin'
+    state: present
+    create: yes
+    owner: ec2-user
+    group: ec2-user
+    mode: '0644'
+
+- name: Create temporary download directory
+  ansible.builtin.file:
+    path: /tmp/oc-mirror-download
+    state: directory
+    mode: '0755'
+
+- name: Download oc-mirror v2 tool
+  ansible.builtin.get_url:
+    url: https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest-4.20/oc-mirror.tar.gz
+    dest: /tmp/oc-mirror-download/oc-mirror.tar.gz
+    mode: '0644'
+    timeout: 300
+
+- name: Extract oc-mirror
+  ansible.builtin.unarchive:
+    src: /tmp/oc-mirror-download/oc-mirror.tar.gz
+    dest: /tmp/oc-mirror-download/
+    remote_src: yes
+    creates: /tmp/oc-mirror-download/oc-mirror
+
+- name: List extracted files for debugging
+  ansible.builtin.shell: ls -la /tmp/oc-mirror-download/
+  register: extracted_files
+  changed_when: false
+
+- name: Display extracted files
+  debug:
+    msg: "{{ extracted_files.stdout_lines }}"
+
+- name: Check if oc-mirror binary exists
+  ansible.builtin.stat:
+    path: /tmp/oc-mirror-download/oc-mirror
+  register: oc_mirror_stat
+
+- name: Fail if oc-mirror not found
+  fail:
+    msg: "oc-mirror binary not found in /tmp/oc-mirror-download/ after extraction"
+  when: not oc_mirror_stat.stat.exists
+
+- name: Install oc-mirror to /usr/local/bin
+  ansible.builtin.copy:
+    src: /tmp/oc-mirror-download/oc-mirror
+    dest: /usr/local/bin/oc-mirror
+    mode: '0755'
+    remote_src: yes
+
+- name: Cleanup download directory
+  ansible.builtin.file:
+    path: /tmp/oc-mirror-download
+    state: absent
+
+- name: Install podman (required for oc-mirror)
+  ansible.builtin.dnf:
+    name:
+      - podman
+      - skopeo
+    state: present
+
+- name: Create podman auth directories for ec2-user
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0700'
+    owner: ec2-user
+    group: ec2-user
+  loop:
+    - /home/ec2-user/.docker
+    - /home/ec2-user/.config/containers
+
+- name: Check if pull secret exists in playbook directory
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/pullsecret.json"
+  register: local_pull_secret
+  delegate_to: localhost
+  become: false
+
+- name: Fail if pull secret not found
+  fail:
+    msg: |
+      ========================================
+      Pull secret not found!
+      ========================================
+
+      Expected location: {{ playbook_dir }}/pullsecret.json
+
+      To get your pull secret:
+        1. Visit: https://console.redhat.com/openshift/downloads
+        2. Download your pull secret
+        3. Save it as: {{ playbook_dir }}/pullsecret.json
+
+      Then re-run this playbook.
+      ========================================
+  when: not local_pull_secret.stat.exists
+
+- name: Copy pull secret to ec2-user .docker directory
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/pullsecret.json"
+    dest: /home/ec2-user/.docker/config.json
+    mode: '0600'
+    owner: ec2-user
+    group: ec2-user
+
+- name: Copy pull secret to ec2-user podman auth directory
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/pullsecret.json"
+    dest: /home/ec2-user/.config/containers/auth.json
+    mode: '0600'
+    owner: ec2-user
+    group: ec2-user
+
+- name: Display pull secret status
+  debug:
+    msg:
+      - "✓ Pull secret copied to EC2 instance"
+      - "  - /home/ec2-user/.docker/config.json"
+      - "  - /home/ec2-user/.config/containers/auth.json"
+
+- name: Verify oc-mirror installation
+  ansible.builtin.command: /usr/local/bin/oc-mirror version
+  register: oc_mirror_version
+  changed_when: false
+
+- name: Display installed version
+  debug:
+    msg:
+      - "=========================================="
+      - "oc-mirror v2 Installation Complete"
+      - "=========================================="
+      - ""
+      - "oc-mirror version:"
+      - "{{ oc_mirror_version.stdout_lines }}"
+      - ""
+      - "Installed to: /usr/local/bin/oc-mirror"
+      - ""
+      - "Usage (note: --v2 flag required for v2 features):"
+      - "  oc-mirror --help"
+      - "  oc-mirror --v2 --config=imageset-config-4.20.yaml file://mirror-output"
+      - ""
+      - "Without --v2 flag, oc-mirror runs in v1 compatibility mode"
+      - "=========================================="

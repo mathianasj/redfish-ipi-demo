@@ -1,0 +1,72 @@
+---
+# Display EC2 instance and OpenShift cluster access information
+# This playbook retrieves and displays:
+#   - EC2 instance connection details (SSH, Cockpit, noVNC, Redfish)
+#   - OpenShift cluster credentials and URLs (if installed)
+#
+# Works with or without OpenShift installed!
+#
+# Usage:
+#   ansible-playbook show-cluster-access.yml
+#
+# Override region if needed:
+#   ansible-playbook show-cluster-access.yml -e aws_region=us-east-1
+
+- name: Discover EC2 instance
+  import_playbook: inventory-ec2.yml
+
+- name: Display OpenShift cluster access information
+  hosts: nested_virt_hosts
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Display purpose
+      debug:
+        msg:
+          - "=========================================="
+          - "Fetching Connection Information"
+          - "=========================================="
+          - ""
+          - "This will retrieve and display:"
+          - ""
+          - "EC2 Instance (always shown):"
+          - "  - SSH access"
+          - "  - Cockpit web console"
+          - "  - Redfish API"
+          - "  - noVNC (if configured)"
+          - ""
+          - "OpenShift Cluster (if installed):"
+          - "  - Cluster name and version"
+          - "  - API server and console URLs"
+          - "  - kubeadmin credentials"
+          - "  - Kubeconfig locations"
+          - ""
+          - "=========================================="
+
+  roles:
+    - display_cluster_access
+
+  post_tasks:
+    - name: Offer to open OpenShift web console
+      debug:
+        msg:
+          - ""
+          - "Quick Link - OpenShift Web Console:"
+          - "  {{ hostvars[inventory_hostname].console_url }}"
+          - ""
+          - "Login with:"
+          - "  Username: kubeadmin"
+          - "  Password: {{ hostvars[inventory_hostname].kubeadmin_password }}"
+      when: hostvars[inventory_hostname].openshift_installed | default(false)
+
+    - name: Offer to open Cockpit
+      debug:
+        msg:
+          - ""
+          - "Quick Link - Cockpit Web Console:"
+          - "  https://{{ hostvars[inventory_hostname].instance_ip }}:9090"
+          - ""
+          - "Login with ec2-user or admin credentials"
+          - "Accept the self-signed certificate warning in your browser"
+      when: hostvars[inventory_hostname].cockpit_status.status.ActiveState is defined and hostvars[inventory_hostname].cockpit_status.status.ActiveState == 'active'

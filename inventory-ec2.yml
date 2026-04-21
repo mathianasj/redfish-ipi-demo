@@ -1,0 +1,68 @@
+---
+# Dynamic inventory playbook - finds existing EC2 instance and adds to inventory
+# This is sourced by other playbooks to discover the nested-virt-host instance
+#
+# Can also be run standalone to test:
+#   ansible-playbook inventory-ec2.yml
+
+- name: Discover EC2 instance and create dynamic inventory
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    aws_region: us-east-2
+    instance_name: nested-virt-host
+    ssh_private_key_path: "~/.ssh/id_rsa_fips"
+
+  tasks:
+    - name: Find existing EC2 instance
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+          "instance-state-name": ["running"]
+      register: existing_instances
+
+    - name: Fail if no running instance found
+      fail:
+        msg: |
+          ========================================
+          No running EC2 instance found!
+          ========================================
+
+          Looked for instance with:
+            Name tag: {{ instance_name }}
+            State: running
+            Region: {{ aws_region }}
+
+          To create an instance, run:
+            ansible-playbook playbook.yml
+
+          If your instance is in a different region, override with:
+            ansible-playbook <playbook> -e aws_region=<region>
+          ========================================
+      when: existing_instances.instances | length == 0
+
+    - name: Display found instance
+      debug:
+        msg:
+          - "Found EC2 instance:"
+          - "  Instance ID: {{ existing_instances.instances[0].instance_id }}"
+          - "  Public IP: {{ existing_instances.instances[0].public_ip_address }}"
+          - "  State: {{ existing_instances.instances[0].state.name }}"
+          - "  Region: {{ aws_region }}"
+
+    - name: Add instance to nested_virt_hosts group
+      add_host:
+        hostname: "{{ existing_instances.instances[0].public_ip_address }}"
+        groupname: nested_virt_hosts
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: "{{ ssh_private_key_path }}"
+      when: existing_instances.instances | length > 0
+
+    - name: Set public IP as fact for other playbooks
+      set_fact:
+        ec2_public_ip: "{{ existing_instances.instances[0].public_ip_address }}"
+        instance_id: "{{ existing_instances.instances[0].instance_id }}"
+        cacheable: yes
+      when: existing_instances.instances | length > 0

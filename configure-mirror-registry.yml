@@ -1,0 +1,85 @@
+---
+# Install oc-mirror v2 tool for mirroring OpenShift images and operators
+# This playbook downloads and installs oc-mirror to /usr/local/bin
+#
+# Prerequisites:
+#   - Download your pull secret from https://console.redhat.com/openshift/downloads
+#   - Save it as: pullsecret.json (in the same directory as this playbook)
+#
+# Usage:
+#   ansible-playbook configure-mirror-registry.yml
+#
+# Override region if needed:
+#   ansible-playbook configure-mirror-registry.yml -e aws_region=us-east-1
+#
+# Or as part of the main playbook:
+#   Add the configure_mirror_registry role to a play
+
+- name: Discover EC2 instance
+  import_playbook: inventory-ec2.yml
+
+- name: Install oc-mirror v2 tool
+  hosts: nested_virt_hosts
+  become: true
+  gather_facts: false
+
+  pre_tasks:
+    - name: Display installation info
+      debug:
+        msg:
+          - "=========================================="
+          - "Installing oc-mirror v2 Tool"
+          - "=========================================="
+          - ""
+          - "This will download and install:"
+          - "  - oc-mirror v2 (latest 4.20)"
+          - "  - Installation path: /usr/local/bin/oc-mirror"
+          - ""
+          - "After installation, you can use:"
+          - "  oc-mirror --v2 --config=imageset-config-4.20.yaml file://mirror-output"
+          - ""
+          - "Note: --v2 flag required for v2 features"
+          - ""
+          - "=========================================="
+
+  roles:
+    - configure_mirror_registry
+
+  post_tasks:
+    - name: Display next steps
+      debug:
+        msg:
+          - "=========================================="
+          - "Next Steps"
+          - "=========================================="
+          - ""
+          - "✓ oc-mirror v2 is installed"
+          - "✓ Pull secret is configured"
+          - ""
+          - "IMPORTANT: Read before mirroring!"
+          - "  cat OC-MIRROR-TIMING.md"
+          - ""
+          - "Mirroring will download 50-80 GB and take 45-90 minutes on EC2"
+          - "Or 1.5-8+ hours on home internet (bandwidth dependent)"
+          - ""
+          - "Quick Start:"
+          - ""
+          - "1. Test with minimal config first (recommended):"
+          - "   mkdir -p /home/ec2-user/mirror-test"
+          - "   oc-mirror --v2 --config=imageset-config-minimal.yaml file:///home/ec2-user/mirror-test"
+          - "   (Only ~10-15 GB, 10-20 minutes)"
+          - ""
+          - "2. Full mirror in tmux (so you can disconnect):"
+          - "   tmux new -s mirror"
+          - "   mkdir -p /home/ec2-user/mirror"
+          - "   oc-mirror --v2 --config=imageset-config-4.20.yaml file:///home/ec2-user/mirror"
+          - "   Detach: Ctrl+B then D"
+          - "   Reattach: tmux attach -t mirror"
+          - ""
+          - "3. Monitor progress (in another terminal):"
+          - "   watch -n 30 'du -sh /home/ec2-user/mirror'"
+          - ""
+          - "Note: The --v2 flag is required to use oc-mirror v2 features."
+          - ""
+          - "See OC-MIRROR-TIMING.md for complete details!"
+          - "=========================================="

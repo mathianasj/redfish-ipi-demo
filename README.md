@@ -345,6 +345,10 @@ For network isolation and advanced routing:
 - [VNC_ACCESS_GUIDE.md](VNC_ACCESS_GUIDE.md) - Remote desktop access
 - [CLEANUP.md](CLEANUP.md) - Resource deletion
 
+### Disconnected/Air-Gapped Environments
+- [OC-MIRROR-TIMING.md](OC-MIRROR-TIMING.md) - Mirror timing, sizing, and best practices
+- [PULL-SECRET.md](PULL-SECRET.md) - Red Hat pull secret setup
+
 ## Cost Estimation
 
 **On-Demand Pricing** (us-east-2):

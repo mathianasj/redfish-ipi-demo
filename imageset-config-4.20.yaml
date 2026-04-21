@@ -1,0 +1,63 @@
+# ImageSetConfiguration for oc-mirror v2
+#
+# WARNING: This config will download 50-80 GB and take 45-90 minutes on EC2
+# or 1.5-8+ hours on home internet. See OC-MIRROR-TIMING.md for details.
+#
+# Test first: Use imageset-config-minimal.yaml (~10-15 GB, 10-20 minutes)
+#
+# Usage:
+#   mkdir -p /home/ec2-user/mirror
+#   oc-mirror --v2 --config=imageset-config-4.20.yaml file:///home/ec2-user/mirror
+#
+kind: ImageSetConfiguration
+apiVersion: mirror.openshift.io/v2alpha1
+mirror:
+  platform:
+    channels:
+      - name: stable-4.20
+        type: ocp
+        # Uncomment and set specific versions if needed, otherwise mirrors latest
+        # minVersion: 4.20.0
+        # maxVersion: 4.20.0
+  operators:
+    - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.20
+      packages:
+        # Local Storage Operator (backend for ODF)
+        - name: local-storage-operator
+          channels:
+            - name: stable
+        # OpenShift Data Foundation operator
+        - name: odf-operator
+          channels:
+            - name: stable-4.20
+        # OpenShift Virtualization operator
+        - name: kubevirt-hyperconverged
+          channels:
+            - name: stable
+        # Additional ODF-related operators (may be pulled as dependencies)
+        - name: odf-csi-addons-operator
+          channels:
+            - name: stable-4.20
+        - name: mcg-operator
+          channels:
+            - name: stable-4.20
+        - name: ocs-operator
+          channels:
+            - name: stable-4.20
+        # Virtualization dependency
+        - name: kubernetes-nmstate-operator
+          channels:
+            - name: stable
+  additionalImages:
+    # OpenShift Virtualization guest OS images
+    # RHEL images
+    - name: registry.redhat.io/rhel9/rhel-guest-image:latest
+    - name: registry.redhat.io/rhel8/rhel-guest-image:latest
+    # CentOS Stream images
+    - name: quay.io/containerdisks/centos-stream:9
+    - name: quay.io/containerdisks/centos-stream:8
+    # Fedora images
+    - name: quay.io/containerdisks/fedora:latest
+    - name: quay.io/containerdisks/fedora:39
+    - name: quay.io/containerdisks/fedora:38
+  helm: {}
