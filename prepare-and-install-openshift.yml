@@ -1,5 +1,5 @@
 ---
-- name: Find EC2 instance
+- name: Find EC2 instance and discover DNS domain
   hosts: localhost
   gather_facts: false
   become: false
@@ -7,8 +7,35 @@
     aws_region: us-east-2
     instance_name: nested-virt-host
     ssh_private_key_path: "~/.ssh/id_rsa_fips"
+    # route53_hosted_zone_id: Z1234567890ABC  # Optional: specify to use Route53 domain
+    # ocp_base_domain: example.com  # Optional: override domain
 
   tasks:
+    - name: Look up Route53 hosted zone if provided
+      amazon.aws.route53_zone_info:
+        query: hosted_zone
+        hosted_zone_id: "{{ route53_hosted_zone_id }}"
+      register: route53_zone_lookup
+      when:
+        - route53_hosted_zone_id is defined
+        - ocp_base_domain is not defined
+
+    - name: Set DNS domain from Route53 zone
+      set_fact:
+        ocp_base_domain: "{{ route53_zone_lookup.HostedZones[0].Name.rstrip('.') }}"
+      when:
+        - route53_hosted_zone_id is defined
+        - ocp_base_domain is not defined
+        - route53_zone_lookup.HostedZones | length > 0
+
+    - name: Display DNS domain being used
+      debug:
+        msg:
+          - "DNS Configuration:"
+          - "  Domain: {{ ocp_base_domain | default('example.com') }}"
+          - "  {% if route53_hosted_zone_id is defined %}Route53 Zone ID: {{ route53_hosted_zone_id }}{% else %}Using default domain{% endif %}"
+      when: ocp_base_domain is defined or route53_hosted_zone_id is defined
+
     - name: Find EC2 instance by name
       amazon.aws.ec2_instance_info:
         region: "{{ aws_region }}"
@@ -28,6 +55,7 @@
         groupname: nested_virt_hosts
         ansible_user: ec2-user
         ansible_ssh_private_key_file: "{{ ssh_private_key_path }}"
+        ocp_base_domain: "{{ ocp_base_domain | default('example.com') }}"
 
     - name: Display instance information
       debug:
@@ -35,6 +63,7 @@
           - "Found EC2 instance: {{ instance_name }}"
           - "Public IP: {{ instance_info.instances[0].public_ip_address }}"
           - "Instance ID: {{ instance_info.instances[0].instance_id }}"
+          - "OpenShift Domain: {{ ocp_base_domain | default('example.com') }}"
           - "Proceeding with OpenShift preparation and installation..."
 
 - name: Prepare and Install OpenShift Cluster
@@ -117,9 +146,13 @@
   roles:
     - role: openshift_install
       tags: ['prepare']
+      vars:
+        ocp_base_domain: "{{ hostvars[inventory_hostname].ocp_base_domain }}"
 
     - role: openshift_install_cluster
       tags: ['install']
+      vars:
+        ocp_base_domain: "{{ hostvars[inventory_hostname].ocp_base_domain }}"
 
   post_tasks:
     - name: Display completion summary
