@@ -32,7 +32,7 @@ cat /sys/module/kvm_intel/parameters/nested
 **CPU Configuration:**
 ```xml
 <cpu mode="custom" match="exact" check="none">
-  <model fallback="allow">Skylake-Server-IBRS</model>
+  <model fallback="allow">Cascadelake-Server-noTSX</model>
   <feature policy="disable" name="vmx"/>
 </cpu>
 ```
@@ -46,15 +46,17 @@ cat /sys/module/kvm_intel/parameters/nested
 - `roles/scale_workers/tasks/scale_up.yml` lines 17-53 (worker VM creation + CPU fix)
 - `fix-ocp-masters-cpu-final.yml` (standalone fix for existing VMs)
 
-## CPU Model Choice: Skylake-Server-IBRS
+## CPU Model Choice: Cascadelake-Server-noTSX
 
-**Why Skylake-Server-IBRS?**
+**Why Cascadelake-Server-noTSX?**
+- Compatible with Intel Xeon 6975P-C (m8i.16xlarge instances)
 - Modern enough for RHCOS (RHEL 9 CoreOS) requirements
 - Widely supported features without nested virtualization
-- IBRS variant includes security mitigations
-- Stable in nested environments
+- noTSX variant disables problematic TSX instructions
+- Prevents KVM hardware error 0x80000021 on newer Intel processors
 
 **Rejected alternatives:**
+- `Skylake-Server-IBRS` → Incompatible with m8i instances, causes VM pausing
 - `host-passthrough` → Auto-expands to GraniteRapids with vmx=on
 - `host-model` → Same auto-expansion issue
 - `qemu64` → Too basic, caused kernel panic
@@ -71,7 +73,7 @@ cat /sys/module/kvm_intel/parameters/nested
 5. Verify nested=N
 
 ### VM Creation (openshift_install role)
-1. Create VMs with `--cpu Skylake-Server-IBRS`
+1. Create VMs with `--cpu Cascadelake-Server-noTSX`
 2. Export VM XML to temp file
 3. Remove auto-generated CPU section
 4. Inject custom CPU config with VMX disabled

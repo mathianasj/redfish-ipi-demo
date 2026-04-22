@@ -348,8 +348,8 @@
     # Remove existing CPU section
     sed -i '/<cpu.*>/,/<\/cpu>/d' /tmp/{{ ocp_master1_system_id }}-cpu-fix.xml
 
-    # Add Skylake-Server-IBRS with VMX disabled
-    sed -i 's|<clock|  <cpu mode="custom" match="exact" check="none">\n    <model fallback="allow">Skylake-Server-IBRS</model>\n    <feature policy="disable" name="vmx"/>\n  </cpu>\n  <clock|' /tmp/{{ ocp_master1_system_id }}-cpu-fix.xml
+    # Add Cascadelake-Server-noTSX with VMX disabled
+    sed -i 's|<clock|  <cpu mode="custom" match="exact" check="none">\n    <model fallback="allow">Cascadelake-Server-noTSX</model>\n    <feature policy="disable" name="vmx"/>\n  </cpu>\n  <clock|' /tmp/{{ ocp_master1_system_id }}-cpu-fix.xml
 
     # Apply via virsh define
     virsh define /tmp/{{ ocp_master1_system_id }}-cpu-fix.xml
@@ -367,8 +367,8 @@
     # Remove existing CPU section
     sed -i '/<cpu.*>/,/<\/cpu>/d' /tmp/{{ ocp_master2_system_id }}-cpu-fix.xml
 
-    # Add Skylake-Server-IBRS with VMX disabled
-    sed -i 's|<clock|  <cpu mode="custom" match="exact" check="none">\n    <model fallback="allow">Skylake-Server-IBRS</model>\n    <feature policy="disable" name="vmx"/>\n  </cpu>\n  <clock|' /tmp/{{ ocp_master2_system_id }}-cpu-fix.xml
+    # Add Cascadelake-Server-noTSX with VMX disabled
+    sed -i 's|<clock|  <cpu mode="custom" match="exact" check="none">\n    <model fallback="allow">Cascadelake-Server-noTSX</model>\n    <feature policy="disable" name="vmx"/>\n  </cpu>\n  <clock|' /tmp/{{ ocp_master2_system_id }}-cpu-fix.xml
 
     # Apply via virsh define
     virsh define /tmp/{{ ocp_master2_system_id }}-cpu-fix.xml
@@ -386,8 +386,8 @@
     # Remove existing CPU section
     sed -i '/<cpu.*>/,/<\/cpu>/d' /tmp/{{ ocp_master3_system_id }}-cpu-fix.xml
 
-    # Add Skylake-Server-IBRS with VMX disabled
-    sed -i 's|<clock|  <cpu mode="custom" match="exact" check="none">\n    <model fallback="allow">Skylake-Server-IBRS</model>\n    <feature policy="disable" name="vmx"/>\n  </cpu>\n  <clock|' /tmp/{{ ocp_master3_system_id }}-cpu-fix.xml
+    # Add Cascadelake-Server-noTSX with VMX disabled
+    sed -i 's|<clock|  <cpu mode="custom" match="exact" check="none">\n    <model fallback="allow">Cascadelake-Server-noTSX</model>\n    <feature policy="disable" name="vmx"/>\n  </cpu>\n  <clock|' /tmp/{{ ocp_master3_system_id }}-cpu-fix.xml
 
     # Apply via virsh define
     virsh define /tmp/{{ ocp_master3_system_id }}-cpu-fix.xml

@@ -41,8 +41,8 @@
     # Remove existing CPU section
     sed -i '/<cpu.*>/,/<\/cpu>/d' /tmp/{{ worker_name }}-cpu-fix.xml
 
-    # Add kvm64 with VMX disabled
-    sed -i 's|<clock|  <cpu mode="custom" match="exact" check="none">\n    <model fallback="allow">kvm64</model>\n    <feature policy="disable" name="vmx"/>\n  </cpu>\n  <clock|' /tmp/{{ worker_name }}-cpu-fix.xml
+    # Add Cascadelake-Server-noTSX with VMX disabled
+    sed -i 's|<clock|  <cpu mode="custom" match="exact" check="none">\n    <model fallback="allow">Cascadelake-Server-noTSX</model>\n    <feature policy="disable" name="vmx"/>\n  </cpu>\n  <clock|' /tmp/{{ worker_name }}-cpu-fix.xml
 
     # Apply via virsh define
     virsh define /tmp/{{ worker_name }}-cpu-fix.xml

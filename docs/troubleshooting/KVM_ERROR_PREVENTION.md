@@ -12,7 +12,7 @@ virt-install \
   --name ocp-master-1 \
   --memory 32768 \
   --vcpus 8 \
-  --cpu Skylake-Server-IBRS \        # ← PROBLEM: Too specific, causes KVM errors
+  --cpu host-passthrough \            # ← PROBLEM: Exposes VMX, causes KVM errors
   --disk size=120,format=qcow2,bus=virtio \
   --network bridge=virbr0,mac=... \
   --boot uefi,network \
@@ -25,7 +25,7 @@ virt-install \
   --name ocp-master-1 \
   --memory 32768 \
   --vcpus 8 \
-  --cpu kvm64 \                       # ← FIXED: Generic CPU model, avoids KVM errors
+  --cpu Cascadelake-Server-noTSX \    # ← FIXED: Modern CPU model compatible with m8i instances
   --disk size=120,format=qcow2,bus=virtio \
   --network bridge=virbr0,mac=... \
   --boot uefi,network \
@@ -35,9 +35,9 @@ virt-install \
 
 ## What These Changes Do
 
-### 1. `--cpu kvm64`
+### 1. `--cpu Cascadelake-Server-noTSX`
 
-**Purpose:** Uses a generic CPU model that works reliably with nested virtualization
+**Purpose:** Uses a modern CPU model compatible with Intel Xeon 6975P-C (m8i instances) that works reliably with nested virtualization
 
 **What it does:**
 - Provides a basic, compatible CPU model that avoids advanced features
