@@ -337,6 +337,53 @@
     group: ec2-user
     mode: '0600'
 
+- name: Check virbr0 network status after installation
+  ansible.builtin.shell: ip link show virbr0 | grep -q "state UP" && echo "UP" || echo "DOWN"
+  register: virbr0_post_install_state
+  changed_when: false
+  become: true
+  ignore_errors: true
+
+- name: Restart virbr0-keepalive VM if virbr0 is DOWN
+  block:
+    - name: Display virbr0 issue detected
+      debug:
+        msg:
+          - "⚠️ virbr0 network is DOWN after OpenShift installation"
+          - "This can happen when openshift-install resets libvirt network"
+          - "Attempting automatic recovery..."
+
+    - name: Restart default network
+      ansible.builtin.shell: |
+        virsh net-destroy default || true
+        sleep 2
+        virsh net-start default
+      ignore_errors: true
+      become: true
+
+    - name: Restart virbr0-keepalive VM
+      ansible.builtin.shell: |
+        virsh destroy virbr0-keepalive || true
+        sleep 2
+        virsh start virbr0-keepalive
+      ignore_errors: true
+      become: true
+
+    - name: Wait for virbr0 to stabilize
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Verify virbr0 is now UP
+      ansible.builtin.shell: ip link show virbr0 | grep -q "state UP" && echo "UP" || echo "DOWN"
+      register: virbr0_recovered_state
+      changed_when: false
+      become: true
+
+    - name: Display virbr0 recovery status
+      debug:
+        msg: "✓ virbr0 network restored: {{ virbr0_recovered_state.stdout }}"
+  when: virbr0_post_install_state.stdout == "DOWN"
+
 - name: Display final log entries
   debug:
     msg:

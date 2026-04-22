@@ -166,15 +166,35 @@ After EC2 instance reboot, virbr0-keepalive must start automatically:
 - ✅ **GOOD**: Autostart enabled → VM starts → virbr0 UP
 - ❌ **BAD**: Autostart disabled → VM stopped → virbr0 DOWN
 
-### Scenario 2: During OpenShift Installation
-If keepalive VM stops mid-installation:
-- virbr0 goes DOWN → Installation fails
-- Fix: Start VM, restart installation
+### Scenario 2: During/After OpenShift Installation
+**COMMON ISSUE**: `openshift-install create cluster` resets libvirt network:
+- Installation completes successfully
+- But `openshift-install` disconnects virbr0-keepalive VM from network
+- virbr0 goes DOWN even though VM is running
+- ✅ **FIX**: Playbook automatically detects and restarts virbr0-keepalive after installation
+- ✅ virbr0 restored to UP state automatically
+
+If keepalive VM stops during installation:
+- virbr0 goes DOWN → Installation fails immediately with "could not find interface virbr0"
+- Fix: Start VM manually, restart installation from scratch
 
 ### Scenario 3: After Cluster Destruction
 After running `destroy-openshift-cluster.yml`:
 - ✅ virbr0-keepalive VM is preserved (not destroyed)
-- virbr0 stays UP, ready for reinstall
+- ⚠️ **ISSUE**: `openshift-install destroy cluster` may reset libvirt network
+- ⚠️ This can disconnect virbr0-keepalive VM from the network
+- ⚠️ virbr0 goes DOWN even though VM is running
+- ✅ **FIX**: Playbook automatically detects and restarts virbr0-keepalive
+- ✅ virbr0 restored to UP state, ready for reinstall
+
+If you still see virbr0 DOWN after destroy:
+```bash
+# Manually fix it
+sudo virsh net-destroy default && sudo virsh net-start default
+sudo virsh destroy virbr0-keepalive && sudo virsh start virbr0-keepalive
+sleep 5
+ip link show virbr0  # Should show state UP
+```
 
 ## Verification Commands
 

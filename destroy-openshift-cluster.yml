@@ -137,6 +137,42 @@
         - ocp_install_dir.stat.exists
         - destroy_result.stdout_lines is defined
 
+    - name: Check virbr0 network status after destroy
+      ansible.builtin.shell: ip link show virbr0 | grep -q "state UP" && echo "UP" || echo "DOWN"
+      register: virbr0_post_destroy_state
+      changed_when: false
+      ignore_errors: true
+
+    - name: Restart virbr0-keepalive VM if virbr0 is DOWN
+      block:
+        - name: Restart default network
+          ansible.builtin.shell: |
+            virsh net-destroy default || true
+            sleep 2
+            virsh net-start default
+          ignore_errors: true
+
+        - name: Restart virbr0-keepalive VM
+          ansible.builtin.shell: |
+            virsh destroy virbr0-keepalive || true
+            sleep 2
+            virsh start virbr0-keepalive
+          ignore_errors: true
+
+        - name: Wait for virbr0 to stabilize
+          ansible.builtin.pause:
+            seconds: 5
+
+        - name: Verify virbr0 is now UP
+          ansible.builtin.shell: ip link show virbr0 | grep -q "state UP" && echo "UP" || echo "DOWN"
+          register: virbr0_final_state
+          changed_when: false
+
+        - name: Display virbr0 recovery status
+          debug:
+            msg: "virbr0 network restored: {{ virbr0_final_state.stdout }}"
+      when: virbr0_post_destroy_state.stdout == "DOWN"
+
     - name: Get list of all OpenShift VMs
       ansible.builtin.shell: virsh list --all --name | grep -E "^ocp-" || true
       register: ocp_vms
@@ -216,17 +252,23 @@
           - "  ✓ DNS server (bind)"
           - "  ✓ Redfish BMC (sushy-tools)"
           - "  ✓ virbr0-keepalive VM"
+          - "  ✓ virbr0 network: {{ virbr0_final_state.stdout | default(virbr0_post_destroy_state.stdout | default('UNKNOWN')) }}"
           - ""
           - "Ready for fresh OpenShift installation:"
           - ""
-          - "  # Full reinstall with Route53 domain"
+          - "  # Auto-discover Route53 (if you have exactly 1 zone)"
+          - "  ansible-playbook playbook.yml \\"
+          - "    -e install_openshift=true \\"
+          - "    -e use_route53=true"
+          - ""
+          - "  # Or with specific Route53 zone ID"
           - "  ansible-playbook playbook.yml \\"
           - "    -e install_openshift=true \\"
           - "    -e route53_hosted_zone_id=Z1234567890ABC"
           - ""
-          - "  # Or step-by-step"
+          - "  # Or step-by-step with auto-discovery"
           - "  ansible-playbook prepare-and-install-openshift.yml \\"
-          - "    -e route53_hosted_zone_id=Z1234567890ABC"
+          - "    -e use_route53=true"
           - ""
           - "=========================================="
 
