@@ -90,19 +90,23 @@ Everything in one go (infrastructure + OpenShift):
 # Activate virtual environment
 source venv/bin/activate
 
-# Option A1: With Route53 domain (recommended)
-# Get your Route53 hosted zone ID first (see Prerequisites step 5)
+# Option A1: Auto-discover Route53 domain (recommended - requires exactly 1 hosted zone)
+ansible-playbook playbook.yml \
+  -e install_openshift=true \
+  -e use_route53=true
+
+# Option A2: Specific Route53 zone (if you have multiple)
 ansible-playbook playbook.yml \
   -e install_openshift=true \
   -e route53_hosted_zone_id=Z1234567890ABC
 
-# Option A2: With default example.com domain
-ansible-playbook playbook.yml -e install_openshift=true
-
-# Option A3: With custom domain (override)
+# Option A3: With custom domain (no Route53 lookup)
 ansible-playbook playbook.yml \
   -e install_openshift=true \
   -e ocp_base_domain=mydomain.com
+
+# Option A4: Default example.com domain (testing only)
+ansible-playbook playbook.yml -e install_openshift=true
 ```
 
 **Use this if:**
@@ -146,14 +150,17 @@ This creates the EC2 instance and configures KVM:
 ```bash
 source venv/bin/activate
 
-# Option 1: With Route53 domain (recommended)
+# Option 1: Auto-discover Route53 (if you have exactly 1 hosted zone)
+ansible-playbook playbook.yml -e use_route53=true
+
+# Option 2: Specific Route53 zone (if you have multiple)
 ansible-playbook playbook.yml -e route53_hosted_zone_id=Z1234567890ABC
 
-# Option 2: With default example.com domain
-ansible-playbook playbook.yml
-
-# Option 3: With custom domain override
+# Option 3: Custom domain (no Route53)
 ansible-playbook playbook.yml -e ocp_base_domain=mydomain.com
+
+# Option 4: Default example.com (testing only)
+ansible-playbook playbook.yml
 ```
 
 **What this does:**
@@ -563,19 +570,55 @@ EOF
 
 ## Cleanup
 
-To remove everything:
+### Option 1: Destroy OpenShift Only (Keep Infrastructure)
+
+Use this to reinstall OpenShift without rebuilding AWS infrastructure:
 
 ```bash
-# Delete OpenShift cluster
-ansible-playbook cleanup.yml
+# Destroy cluster, keep EC2 instance
+ansible-playbook destroy-openshift-cluster.yml -e confirm_destroy=true
 
-# Or manually
+# Then reinstall OpenShift
+ansible-playbook playbook.yml \
+  -e install_openshift=true \
+  -e route53_hosted_zone_id=Z1234567890ABC
+```
+
+**What this removes:**
+- ✓ OpenShift cluster (all nodes, services, data)
+- ✓ Master VMs
+- ✓ Installation directory and credentials
+
+**What this keeps:**
+- ✓ EC2 instance
+- ✓ AWS infrastructure (VPC, networking)
+- ✓ DNS server (bind)
+- ✓ Redfish BMC (sushy-tools)
+
+### Option 2: Delete Everything (Full Cleanup)
+
+Removes all AWS resources:
+
+```bash
+# Delete everything
+ansible-playbook cleanup.yml -e confirm_deletion=true
+```
+
+**What this removes:**
+- ✓ EC2 instance
+- ✓ All EBS volumes
+- ✓ VPC, subnets, security groups
+- ✓ Everything
+
+### Option 3: Manual Cluster Destruction
+
+```bash
+# SSH to EC2
 ssh ec2-user@<instance-ip>
+
+# Destroy OpenShift cluster
 cd ~/openshift-install
 ./openshift-install destroy cluster --dir .
-
-# Delete EC2 infrastructure
-ansible-playbook cleanup.yml --tags infrastructure
 ```
 
 ## Cost Optimization

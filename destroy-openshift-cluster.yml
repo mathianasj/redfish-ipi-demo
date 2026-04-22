@@ -1,0 +1,259 @@
+---
+# Destroy OpenShift Cluster Only (Keep EC2 Infrastructure)
+#
+# This playbook destroys the OpenShift cluster while keeping the EC2
+# instance and infrastructure intact for a fresh reinstall.
+#
+# Usage:
+#   ansible-playbook destroy-openshift-cluster.yml
+#   ansible-playbook destroy-openshift-cluster.yml -e confirm_destroy=true  # Skip confirmation
+#
+# What this does:
+#   - Runs openshift-install destroy cluster
+#   - Destroys all master VMs
+#   - Cleans up OpenShift directories
+#   - Optionally cleans up Route53 DNS records
+#   - Keeps EC2 instance and infrastructure for reinstall
+#
+# What this DOES NOT do:
+#   - Does NOT delete EC2 instance
+#   - Does NOT delete VPC or networking
+#   - Does NOT delete storage volumes
+#   - Does NOT delete virbr0-keepalive VM
+
+- name: Find EC2 instance
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    aws_region: us-east-2
+    instance_name: nested-virt-host
+    ssh_private_key_path: "~/.ssh/id_rsa_fips"
+    confirm_destroy: false  # Set to true to skip confirmation
+
+  tasks:
+    - name: Safety check - confirm destruction
+      fail:
+        msg: |
+          ============================================
+          WARNING: This will DESTROY the OpenShift cluster!
+          ============================================
+
+          This playbook will permanently destroy:
+          - OpenShift cluster (all nodes, services, data)
+          - All master VMs (ocp-master-*)
+          - OpenShift installation directory
+          - Cluster configuration and credentials
+
+          This will NOT delete:
+          - EC2 instance ({{ instance_name }})
+          - AWS infrastructure (VPC, networking)
+          - Storage volumes
+          - DNS server configuration
+
+          After destruction, you can reinstall OpenShift with:
+            ansible-playbook playbook.yml -e install_openshift=true
+
+          To proceed, run with: -e confirm_destroy=true
+          ============================================
+      when: not (confirm_destroy | bool)
+
+    - name: Find EC2 instance by name
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ instance_name }}"
+          "instance-state-name": ["running"]
+      register: instance_info
+
+    - name: Verify instance exists
+      fail:
+        msg: "No running EC2 instance found with name '{{ instance_name }}' in region {{ aws_region }}"
+      when: instance_info.instances | length == 0
+
+    - name: Add EC2 instance to inventory
+      add_host:
+        hostname: "{{ instance_info.instances[0].public_ip_address }}"
+        groupname: nested_virt_hosts
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: "{{ ssh_private_key_path }}"
+
+    - name: Display instance information
+      debug:
+        msg:
+          - "=========================================="
+          - "Destroying OpenShift Cluster"
+          - "=========================================="
+          - ""
+          - "EC2 Instance: {{ instance_name }}"
+          - "Public IP: {{ instance_info.instances[0].public_ip_address }}"
+          - "Instance ID: {{ instance_info.instances[0].instance_id }}"
+          - ""
+          - "This will take approximately 5-10 minutes."
+          - "=========================================="
+
+- name: Destroy OpenShift cluster
+  hosts: nested_virt_hosts
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Check if OpenShift installation directory exists
+      ansible.builtin.stat:
+        path: /home/ec2-user/openshift-install
+      register: ocp_install_dir
+      become: false
+
+    - name: Display status
+      debug:
+        msg:
+          - "OpenShift installation directory: {{ 'Found' if ocp_install_dir.stat.exists else 'Not found' }}"
+          - "Proceeding with cluster destruction..."
+
+    - name: Stop all OpenShift master VMs
+      ansible.builtin.shell: |
+        for vm in $(virsh list --name | grep -E "^ocp-"); do
+          echo "Stopping VM: $vm"
+          virsh destroy $vm || true
+        done
+      register: stop_vms_result
+      changed_when: stop_vms_result.stdout != ""
+      ignore_errors: true
+
+    - name: Run openshift-install destroy cluster
+      ansible.builtin.shell: |
+        cd /home/ec2-user/openshift-install
+        ./openshift-install destroy cluster --dir=. --log-level=info
+      register: destroy_result
+      become: false
+      when: ocp_install_dir.stat.exists
+      ignore_errors: true
+      timeout: 600
+
+    - name: Display destroy output
+      debug:
+        msg: "{{ destroy_result.stdout_lines }}"
+      when:
+        - ocp_install_dir.stat.exists
+        - destroy_result.stdout_lines is defined
+
+    - name: Get list of all OpenShift VMs
+      ansible.builtin.shell: virsh list --all --name | grep -E "^ocp-" || true
+      register: ocp_vms
+      changed_when: false
+
+    - name: Undefine all OpenShift master VMs
+      ansible.builtin.shell: |
+        for vm in {{ ocp_vms.stdout_lines | join(' ') }}; do
+          echo "Undefining VM: $vm"
+          virsh undefine $vm --nvram --remove-all-storage || true
+        done
+      when: ocp_vms.stdout != ""
+      register: undefine_result
+      changed_when: undefine_result.rc == 0
+
+    - name: Clean up OpenShift installation directory
+      ansible.builtin.file:
+        path: /home/ec2-user/openshift-install
+        state: absent
+      become: false
+      when: ocp_install_dir.stat.exists
+
+    - name: Clean up cluster access file
+      ansible.builtin.file:
+        path: /home/ec2-user/openshift-cluster-access.txt
+        state: absent
+      become: false
+      ignore_errors: true
+
+    - name: Clean up local kubeconfig
+      ansible.builtin.file:
+        path: /home/ec2-user/.kube/config
+        state: absent
+      become: false
+      ignore_errors: true
+
+    - name: Check for leftover VM disk images
+      ansible.builtin.find:
+        paths:
+          - /var/lib/libvirt/images
+          - /home/libvirt-images
+        patterns: "ocp-*.qcow2"
+      register: leftover_disks
+
+    - name: Remove leftover VM disk images
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ leftover_disks.files }}"
+      when: leftover_disks.files | length > 0
+
+    - name: Verify no OpenShift VMs remain
+      ansible.builtin.shell: virsh list --all --name | grep -E "^ocp-" || echo "none"
+      register: remaining_vms
+      changed_when: false
+
+    - name: Display remaining VMs check
+      debug:
+        msg: "Remaining OpenShift VMs: {{ remaining_vms.stdout if remaining_vms.stdout != 'none' else 'None found' }}"
+
+    - name: Display cleanup summary
+      debug:
+        msg:
+          - "=========================================="
+          - "✓ OpenShift Cluster Destruction Complete"
+          - "=========================================="
+          - ""
+          - "Destroyed resources:"
+          - "  ✓ OpenShift cluster"
+          - "  ✓ Master VMs: {{ ocp_vms.stdout_lines | length if ocp_vms.stdout != '' else 0 }}"
+          - "  ✓ Installation directory"
+          - "  ✓ Cluster credentials"
+          - "  ✓ Leftover disk images: {{ leftover_disks.files | length }}"
+          - ""
+          - "Infrastructure still running:"
+          - "  ✓ EC2 instance: {{ ansible_host }}"
+          - "  ✓ DNS server (bind)"
+          - "  ✓ Redfish BMC (sushy-tools)"
+          - "  ✓ virbr0-keepalive VM"
+          - ""
+          - "Ready for fresh OpenShift installation:"
+          - ""
+          - "  # Full reinstall with Route53 domain"
+          - "  ansible-playbook playbook.yml \\"
+          - "    -e install_openshift=true \\"
+          - "    -e route53_hosted_zone_id=Z1234567890ABC"
+          - ""
+          - "  # Or step-by-step"
+          - "  ansible-playbook prepare-and-install-openshift.yml \\"
+          - "    -e route53_hosted_zone_id=Z1234567890ABC"
+          - ""
+          - "=========================================="
+
+- name: Optional - Clean up Route53 DNS records
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    cleanup_route53: false  # Set to true to remove Route53 DNS records
+
+  tasks:
+    - name: Display Route53 cleanup info
+      debug:
+        msg:
+          - ""
+          - "Route53 DNS Cleanup:"
+          - "  DNS records were NOT deleted (set cleanup_route53=true to remove)"
+          - ""
+          - "To manually remove Route53 records:"
+          - "  aws route53 list-resource-record-sets --hosted-zone-id <zone-id>"
+          - "  # Delete api.sno.<domain> and *.apps.sno.<domain> records"
+          - ""
+      when: not (cleanup_route53 | bool)
+
+    - name: Cleanup Route53 DNS records
+      debug:
+        msg:
+          - "Route53 DNS cleanup would happen here"
+          - "Run: ansible-playbook destroy-openshift-cluster.yml -e cleanup_route53=true -e route53_hosted_zone_id=Z123..."
+      when: cleanup_route53 | bool
