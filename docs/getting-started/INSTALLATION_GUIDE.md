@@ -90,8 +90,19 @@ Everything in one go (infrastructure + OpenShift):
 # Activate virtual environment
 source venv/bin/activate
 
-# Run complete deployment (90-120 minutes)
+# Option A1: With Route53 domain (recommended)
+# Get your Route53 hosted zone ID first (see Prerequisites step 5)
+ansible-playbook playbook.yml \
+  -e install_openshift=true \
+  -e route53_hosted_zone_id=Z1234567890ABC
+
+# Option A2: With default example.com domain
 ansible-playbook playbook.yml -e install_openshift=true
+
+# Option A3: With custom domain (override)
+ansible-playbook playbook.yml \
+  -e install_openshift=true \
+  -e ocp_base_domain=mydomain.com
 ```
 
 **Use this if:**
@@ -134,7 +145,15 @@ This creates the EC2 instance and configures KVM:
 
 ```bash
 source venv/bin/activate
+
+# Option 1: With Route53 domain (recommended)
+ansible-playbook playbook.yml -e route53_hosted_zone_id=Z1234567890ABC
+
+# Option 2: With default example.com domain
 ansible-playbook playbook.yml
+
+# Option 3: With custom domain override
+ansible-playbook playbook.yml -e ocp_base_domain=mydomain.com
 ```
 
 **What this does:**
