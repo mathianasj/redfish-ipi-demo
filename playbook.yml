@@ -10,9 +10,9 @@
 # Usage:
 #   Prepare only (default):           ansible-playbook playbook.yml
 #   Prepare + Install:                ansible-playbook playbook.yml -e install_openshift=true
-#   With Route53 domain:              ansible-playbook playbook.yml -e route53_hosted_zone_id=Z1234567890ABC
-#   Full install with Route53:        ansible-playbook playbook.yml -e install_openshift=true -e route53_hosted_zone_id=Z1234567890ABC
-#   With custom domain override:      ansible-playbook playbook.yml -e ocp_base_domain=mydomain.com
+#   Auto-discover Route53:            ansible-playbook playbook.yml -e use_route53=true -e install_openshift=true
+#   Specific Route53 zone:            ansible-playbook playbook.yml -e route53_hosted_zone_id=Z1234567890ABC -e install_openshift=true
+#   Custom domain override:           ansible-playbook playbook.yml -e ocp_base_domain=mydomain.com -e install_openshift=true
 #
 # Total estimated time:
 #   - Preparation only: 20-35 minutes
@@ -127,30 +127,73 @@
       when: install_openshift | default(false) | bool
 
   tasks:
-    - name: Look up Route53 hosted zone if provided
-      amazon.aws.route53_zone_info:
+    - name: Auto-discover Route53 hosted zones
+      block:
+        - name: List all Route53 hosted zones
+          amazon.aws.route53_info:
+            query: hosted_zone
+            hosted_zone_method: list
+          register: all_route53_zones
+          when: use_route53 | default(false) | bool
+
+        - name: Fail if no Route53 zones found
+          fail:
+            msg: |
+              No Route53 hosted zones found in your AWS account.
+              Either create a hosted zone first or use -e ocp_base_domain=yourdomain.com
+          when:
+            - use_route53 | default(false) | bool
+            - all_route53_zones.hosted_zones | length == 0
+
+        - name: Fail if multiple Route53 zones found
+          fail:
+            msg: |
+              Multiple Route53 hosted zones found. Please specify which one to use:
+              {% for zone in all_route53_zones.hosted_zones %}
+              - {{ zone.name }} ({{ zone.id.split('/')[-1] }})
+              {% endfor %}
+
+              Run with: -e route53_hosted_zone_id=<zone-id>
+          when:
+            - use_route53 | default(false) | bool
+            - all_route53_zones.hosted_zones | length > 1
+
+        - name: Set DNS domain from auto-discovered Route53 zone
+          set_fact:
+            ocp_base_domain: "{{ all_route53_zones.hosted_zones[0].name.rstrip('.') }}"
+            discovered_zone_id: "{{ all_route53_zones.hosted_zones[0].id.split('/')[-1] }}"
+          when:
+            - use_route53 | default(false) | bool
+            - all_route53_zones.hosted_zones | length == 1
+      when:
+        - ocp_base_domain is not defined
+        - route53_hosted_zone_id is not defined
+
+    - name: Look up specific Route53 hosted zone if ID provided
+      amazon.aws.route53_info:
         query: hosted_zone
+        hosted_zone_method: details
         hosted_zone_id: "{{ route53_hosted_zone_id }}"
       register: route53_zone_lookup
       when:
         - route53_hosted_zone_id is defined
         - ocp_base_domain is not defined
 
-    - name: Set DNS domain from Route53 zone
+    - name: Set DNS domain from specified Route53 zone
       set_fact:
-        ocp_base_domain: "{{ route53_zone_lookup.HostedZones[0].Name.rstrip('.') }}"
+        ocp_base_domain: "{{ route53_zone_lookup.hosted_zones[0].name.rstrip('.') }}"
       when:
         - route53_hosted_zone_id is defined
         - ocp_base_domain is not defined
-        - route53_zone_lookup.HostedZones | length > 0
+        - route53_zone_lookup.hosted_zones | length > 0
 
     - name: Display DNS domain being used
       debug:
         msg:
           - "DNS Configuration:"
           - "  Domain: {{ ocp_base_domain | default('example.com') }}"
-          - "  {% if route53_hosted_zone_id is defined %}Route53 Zone ID: {{ route53_hosted_zone_id }}{% else %}Using default domain{% endif %}"
-      when: ocp_base_domain is defined or route53_hosted_zone_id is defined
+          - "  {% if discovered_zone_id is defined %}Route53 Zone (auto-discovered): {{ discovered_zone_id }}{% elif route53_hosted_zone_id is defined %}Route53 Zone ID: {{ route53_hosted_zone_id }}{% else %}Using default domain{% endif %}"
+      when: ocp_base_domain is defined or route53_hosted_zone_id is defined or use_route53 | default(false) | bool
 
     - name: Read SSH public key
       ansible.builtin.slurp:
